@@ -193,8 +193,95 @@ test("native hook timeout budget keeps query compiler inside the unified 8 secon
 
   assert.equal(MEMX_NATIVE_HOOK_TIMEOUT_MS, 8000);
   assert.equal(httpTimeoutMs, 7500);
-  assert.equal(queryTimeoutMs, 7250);
+  assert.ok(
+    queryTimeoutMs <= 4500,
+    "the query compiler must leave enough of the 8s hook budget for retrieval and HTTP return",
+  );
+  assert.ok(queryTimeoutMs >= 3000);
   assert.ok(queryTimeoutMs < httpTimeoutMs);
+});
+
+test("anchored native recall with no target entity evidence withholds unrelated strong evidence", async () => {
+  const { assessNativeContextEligibility, focusRecallBundleForQueryEntities } = await import(
+    "../dist/.runtime/src/host/service.mjs"
+  );
+  const query = "TideLedger 导出流水线现在默认用什么队列？";
+  const queryAnalysis = directFactQueryAnalysis(query, "TideLedger 导出流水线", "default message queue");
+  const unrelatedPacket = {
+    packetId: "packet-unrelated-qingshi",
+    slotId: "answer_value",
+    operationType: "return_value",
+    role: "answer",
+    protected: false,
+    injected: true,
+    layers: ["fact"],
+    primaryText: "青石报表 has default database postgresql",
+    supportingTexts: [],
+    sourceRefs: ["fact:qingshi:default_database"],
+    supportSourceRefs: [],
+    allSourceRefs: ["fact:qingshi:default_database"],
+    normalizedSourceRefs: ["fact:qingshi:default_database"],
+    normalizedSupportSourceRefs: [],
+    normalizedAllSourceRefs: ["fact:qingshi:default_database"],
+    score: 0.91,
+    scoreBreakdown: {
+      retrievalScore: 0.91,
+      answerScore: 0.91,
+      contextBindingScore: 0.91,
+      slotCoverageScore: 0.91,
+      authorityScore: 0.91,
+      finalScore: 0.91,
+    },
+    displayLines: ["[answer] 青石报表 has default database postgresql"],
+    authorRoles: ["memory"],
+    coverage: { filled: true, missing: [], confidence: 0.91 },
+    eligibility: { eligible: true, role: "answer", blockers: [] },
+    grade: {
+      retrievalScore: 0.91,
+      answerScore: 0.91,
+      contextBindingScore: 0.91,
+      slotCoverageScore: 0.91,
+      authorityScore: 0.91,
+      finalScore: 0.91,
+    },
+    selectionReason: "test-unrelated-strong-evidence",
+  };
+  const bundle = {
+    routeType: "factual",
+    routeConfidence: 0.91,
+    queryText: query,
+    queryAnchors: ["TideLedger 导出流水线", "default message queue"],
+    states: [],
+    tasks: [],
+    facts: [
+      {
+        id: "fact:qingshi:default_database",
+        text: "青石报表 has default database postgresql",
+        score: 0.91,
+        scope: "agent:main",
+        confidence: 0.91,
+        sourceRef: "fact:qingshi:default_database",
+      },
+    ],
+    events: [],
+    graph: { nodes: [], edges: [], paths: [], pathCandidates: [] },
+    alternates: [],
+    diagnostics: [],
+    behavioralGuidance: [],
+    recalledChunkIds: [],
+    recalledChunkTexts: [],
+    promptEvidence: [],
+    evidencePackets: [unrelatedPacket],
+    renderedBlock: "",
+  };
+
+  const focused = focusRecallBundleForQueryEntities(queryAnalysis, bundle);
+  assert.equal(focused.evidencePackets.length, 0);
+  assert.equal(focused.facts.length, 0);
+
+  const eligibility = assessNativeContextEligibility(query, queryAnalysis, focused);
+  assert.equal(eligibility.eligible, false);
+  assert.equal(eligibility.reason, "no-injected-packets");
 });
 
 test("SessionEnd without a pending turn does not replay the latest transcript assistant", async () => {
@@ -795,6 +882,118 @@ test("current fact updates merge bilingual entity descriptors before superseding
 
     assert.match(bundle.renderedBlock, /pulsar/i);
     assert.doesNotMatch(bundle.renderedBlock, /nats/i);
+    await manager.closeAll();
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("current fact recall refuses a stale canonical fact when newer source evidence was not semantically compiled", async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), "memx-stale-fact-newer-source-"));
+  const dbPath = join(tempDir, "memx.sqlite");
+
+  try {
+    const manager = new MemxRuntimeManager(logger());
+    const ctx = ctxFor(dbPath);
+    const store = await manager.getStore(ctx);
+    store.reasoner.isEnabled = () => true;
+    store.reasoner.summarizeChunk = async (text) => text.slice(0, 120);
+    let semanticCall = 0;
+    store.reasoner.compileTurnSemantics = async () => {
+      semanticCall += 1;
+      if (semanticCall === 1) {
+        return {
+          sourceRefs: ["user:riverpay-queue:0", "assistant:riverpay-queue:1"],
+          assertionDrafts: [
+            {
+              draftId: "riverpay-queue-nats",
+              sourceRef: "user:riverpay-queue:0",
+              familyHint: "fact_like",
+              timeframeHint: "current",
+              entityHints: [
+                { name: "RiverPay export pipeline", type: "project" },
+                { name: "NATS", type: "service" },
+              ],
+              slotHints: ["default_message_queue"],
+              valueHint: "NATS",
+              confidence: 0.94,
+              supportSpans: [
+                {
+                  sourceRef: "user:riverpay-queue:0",
+                  text: "RiverPay export pipeline uses NATS as its default message queue.",
+                },
+              ],
+            },
+          ],
+          compilerProvenance: { source: "llm", mode: "semantic-compiler-authoritative" },
+        };
+      }
+      return null;
+    };
+
+    await store.turnScheduler.enqueue(ctx, [
+      {
+        role: "user",
+        content: "Remember: RiverPay export pipeline uses NATS as its default message queue.",
+        scope: "agent:main",
+        sessionKey: "s1",
+        turnId: "riverpay-queue",
+        sourceRef: "user:riverpay-queue:0",
+        observedAt,
+      },
+      {
+        role: "assistant",
+        content: "Noted. RiverPay export pipeline defaults to NATS.",
+        scope: "agent:main",
+        sessionKey: "s1",
+        turnId: "riverpay-queue",
+        sourceRef: "assistant:riverpay-queue:1",
+        observedAt,
+      },
+    ]);
+    await store.turnScheduler.flush();
+    await store.turnScheduler.enqueue(ctx, [
+      {
+        role: "user",
+        content: "这个队列方案先不要再考虑了，RiverPay export pipeline 以后默认用 Pulsar。",
+        scope: "agent:main",
+        sessionKey: "s1",
+        turnId: "riverpay-queue-update",
+        sourceRef: "user:riverpay-queue-update:0",
+        observedAt: "2026-05-21T00:01:00.000Z",
+      },
+      {
+        role: "assistant",
+        content: "明白，后续 RiverPay export pipeline 默认用 Pulsar。",
+        scope: "agent:main",
+        sessionKey: "s1",
+        turnId: "riverpay-queue-update",
+        sourceRef: "assistant:riverpay-queue-update:1",
+        observedAt: "2026-05-21T00:01:00.000Z",
+      },
+    ]);
+    await store.turnScheduler.flush();
+
+    const activeFacts = store.client
+      .prepare("SELECT canonical_object FROM facts WHERE canonical_subject = ? AND predicate = ? AND status = 'active'")
+      .all("riverpay export pipeline", "has_default_message_queue");
+    assert.deepEqual(
+      activeFacts.map((row) => row.canonical_object),
+      ["nats"],
+      "the regression setup should leave the canonical fact stale because semantic extraction failed",
+    );
+
+    const query = "RiverPay export pipeline 现在默认用什么消息队列？";
+    const bundle = await retrieveEvidence(store, ctx, query, query, {
+      queryAnalysis: directFactQueryAnalysis(query, "RiverPay export pipeline", "default message queue"),
+    });
+
+    assert.match(bundle.renderedBlock, /pulsar/i);
+    assert.doesNotMatch(bundle.renderedBlock, /nats/i);
+    assert.ok(
+      bundle.diagnostics.some((entry) => entry.includes("newer-source")),
+      "retrieval diagnostics should make stale-fact suppression auditable",
+    );
     await manager.closeAll();
   } finally {
     await rm(tempDir, { recursive: true, force: true });

@@ -1233,6 +1233,7 @@ function promptEvidenceRequiresAnswerSlotSupport(queryAnalysis: RecallQueryAnaly
 }
 
 function isGenericRequiredField(key: string): boolean {
+  const normalizedKey = normalizeText(key).replace(/[\s-]+/g, "_");
   return [
     "answer_value",
     "attribute_value",
@@ -1242,7 +1243,7 @@ function isGenericRequiredField(key: string): boolean {
     "preference_or_prior_action",
     "source_evidence",
     "query_context",
-  ].includes(key);
+  ].includes(normalizedKey);
 }
 
 function slotCoverageForText(
@@ -3049,6 +3050,8 @@ function buildPromptEvidenceCandidates(params: {
   events: EvidenceRow[];
   controlEvidence?: PromptEvidenceCandidate[];
   selectedExactSnippets?: ExactSnippetCandidate[];
+  suppressedCandidateIds?: Set<string>;
+  suppressCandidateEvidenceBeforeMs?: number;
 }): PromptEvidenceCandidate[] {
   const candidates: PromptEvidenceCandidate[] = [];
   const excerptAnchors = promptEvidenceExcerptAnchors(params.queryAnalysis);
@@ -3058,11 +3061,28 @@ function buildPromptEvidenceCandidates(params: {
     ...(params.candidateGenerationResult?.bridgeCandidates ?? []),
   ];
   for (const hit of candidateHits) {
+    const hitIds = uniqueNonEmpty([
+      hit.docId,
+      hit.candidateId,
+      hit.lineage.canonicalId,
+      hit.lineage.sourceId,
+    ].filter((id): id is string => typeof id === "string" && id.trim().length > 0));
+    if (hitIds.some((id) => params.suppressedCandidateIds?.has(id))) {
+      continue;
+    }
     const surface = candidateSurfaceToPromptSurface(hit.surface);
     if (!surface) {
       continue;
     }
     const metadata = hydrateFactCandidateMetadata(params.store, hit);
+    const observedAt = typeof metadata?.observedAt === "string" ? Date.parse(metadata.observedAt) : Number.NaN;
+    if (
+      typeof params.suppressCandidateEvidenceBeforeMs === "number" &&
+      Number.isFinite(observedAt) &&
+      observedAt < params.suppressCandidateEvidenceBeforeMs
+    ) {
+      continue;
+    }
     if (hit.surface === "fact" && !factCandidateVisibleForQuery(params.queryAnalysis, metadata)) {
       continue;
     }
@@ -3550,6 +3570,109 @@ function buildSupportRefChunkRows(params: {
       })
       .map((entry) => entry.row),
     params.limit,
+  );
+}
+
+function queryEntityAnchorTerms(queryAnalysis: RecallQueryAnalysis): string[] {
+  return uniqueNonEmpty(
+    (queryAnalysis.queryEntities ?? [])
+      .map((entity) => entity.name)
+      .filter((value): value is string => typeof value === "string" && value.trim().length > 0),
+  );
+}
+
+function queryAttributeAnchorTerms(queryAnalysis: RecallQueryAnalysis): string[] {
+  const entityTerms = new Set(queryEntityAnchorTerms(queryAnalysis).map((entry) => normalizeText(entry)));
+  const slotTerms = (queryAnalysis.evidencePlan?.slots ?? []).flatMap((slot) => [
+    slot.description,
+    ...(slot.relationHints ?? []),
+    ...(slot.capabilityQueries ?? []),
+    ...slot.requiredFields,
+  ]);
+  const goalTerms = (queryAnalysis.evidenceGoals ?? []).flatMap((goal) => [
+    goal.goal,
+    ...(goal.positiveQueries ?? []),
+    ...(goal.focusAnchors ?? []),
+  ]);
+  return uniqueNonEmpty([...(queryAnalysis.anchors ?? []), ...slotTerms, ...goalTerms], 24).filter(
+    (term) => {
+      const normalized = normalizeText(term);
+      return (
+        normalized &&
+        !entityTerms.has(normalized) &&
+        !isGenericRequiredField(normalized) &&
+        isMeaningfulRecallAnchor(term)
+      );
+    },
+  );
+}
+
+function rowMentionsQueryEntity(row: EvidenceRow, entityTerms: string[]): boolean {
+  if (entityTerms.length === 0) {
+    return true;
+  }
+  const normalizedText = normalizeText(row.text);
+  return entityTerms.some((term) => {
+    const normalized = normalizeText(term);
+    return (
+      normalized.length > 0 &&
+      (normalizedText.includes(normalized) ||
+        projectNamesMatch(row.text, term) ||
+        semanticTextSimilarity(row.text, term) >= 0.46)
+    );
+  });
+}
+
+function rowSupportsQueryAttribute(row: EvidenceRow, attributeTerms: string[]): boolean {
+  if (attributeTerms.length === 0) {
+    return true;
+  }
+  const support = Math.max(
+    queryAnchorSupport(row.text, attributeTerms),
+    ...attributeTerms.map((term) => semanticTextSimilarity(row.text, term)),
+  );
+  return support >= 0.24;
+}
+
+function observedAtMs(row: EvidenceRow): number {
+  const parsed = row.observedAt ? Date.parse(row.observedAt) : Number.NaN;
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function shouldApplyNewerSourceFactGuard(queryAnalysis: RecallQueryAnalysis): boolean {
+  const operation = queryAnalysis.evidencePlan?.operation.type;
+  return (
+    queryAnalysis.queryShape.timeframe === "current" &&
+    (queryAnalysis.queryShape.granularity === "exact_detail" ||
+      queryAnalysis.answerGranularity === "detail") &&
+    (operation === "return_value" ||
+      queryAnalysis.answerMode === "attribute_lookup" ||
+      queryAnalysis.answerMode === "single_fact")
+  );
+}
+
+function newerSourceRowsForCurrentFactGuard(params: {
+  facts: EvidenceRow[];
+  sourceRows: EvidenceRow[];
+  queryAnalysis: RecallQueryAnalysis;
+}): EvidenceRow[] {
+  if (!shouldApplyNewerSourceFactGuard(params.queryAnalysis) || params.facts.length === 0) {
+    return [];
+  }
+  const newestFactObservedAt = Math.max(0, ...params.facts.map((row) => observedAtMs(row)));
+  if (newestFactObservedAt <= 0) {
+    return [];
+  }
+  const entityTerms = queryEntityAnchorTerms(params.queryAnalysis);
+  const attributeTerms = queryAttributeAnchorTerms(params.queryAnalysis);
+  return dedupeEvidenceRows(
+    params.sourceRows
+      .filter((row) => observedAtMs(row) > newestFactObservedAt)
+      .filter((row) => !isQuestionLike(row.text))
+      .filter((row) => rowMentionsQueryEntity(row, entityTerms))
+      .filter((row) => rowSupportsQueryAttribute(row, attributeTerms))
+      .sort((left, right) => observedAtMs(right) - observedAtMs(left) || (right.score ?? 0) - (left.score ?? 0)),
+    3,
   );
 }
 
@@ -5847,6 +5970,9 @@ export async function retrieveEvidence(
     facts = factualFacts;
   }
   const scheduledFactRows = facts.slice();
+  let currentFactGuardSourceRows: EvidenceRow[] = [];
+  const suppressedPromptEvidenceCandidateIds = new Set<string>();
+  let suppressPromptEvidenceBeforeMs: number | undefined;
 
   if (
     candidateGenerationResult &&
@@ -5875,6 +6001,7 @@ export async function retrieveEvidence(
       queryAnchors,
       Math.max(3, Math.min(6, ctx.config.advanced.recallChunkBudget)),
     );
+    currentFactGuardSourceRows = [...candidateEventRows, ...candidateChunkRows];
 
     if (candidateStateRows.length > 0) {
       states = candidateStateRows;
@@ -5894,6 +6021,34 @@ export async function retrieveEvidence(
       );
       diagnostics.push("candidate-authority:event-main");
     }
+  }
+
+  const newerCurrentSourceRows = newerSourceRowsForCurrentFactGuard({
+    facts,
+    sourceRows: currentFactGuardSourceRows,
+    queryAnalysis,
+  });
+  if (newerCurrentSourceRows.length > 0) {
+    for (const fact of facts) {
+      for (const id of uniqueNonEmpty([
+        fact.id,
+        fact.id.startsWith("fact:") ? fact.id.slice(5) : `fact:${fact.id}`,
+        fact.lineage?.canonicalId,
+        fact.lineage?.sourceId,
+      ])) {
+        suppressedPromptEvidenceCandidateIds.add(id);
+      }
+    }
+    suppressPromptEvidenceBeforeMs = Math.min(...newerCurrentSourceRows.map((row) => observedAtMs(row)));
+    facts = [];
+    events = dedupeEvidenceRows(
+      [
+        ...newerCurrentSourceRows,
+        ...events.filter((row) => observedAtMs(row) >= (suppressPromptEvidenceBeforeMs ?? 0)),
+      ],
+      Math.max(4, ctx.config.advanced.recallChunkBudget),
+    );
+    diagnostics.push("newer-source-evidence-suppressed-stale-current-fact");
   }
 
   const complementaryFactRows = selectComplementaryFactRowsForMainSurface({
@@ -6059,6 +6214,8 @@ export async function retrieveEvidence(
     events,
     controlEvidence,
     selectedExactSnippets,
+    suppressedCandidateIds: suppressedPromptEvidenceCandidateIds,
+    suppressCandidateEvidenceBeforeMs: suppressPromptEvidenceBeforeMs,
   });
   const evidenceAssembly = assembleEvidencePackets({
     queryAnalysis,

@@ -501,7 +501,12 @@ export function focusRecallBundleForQueryEntities(
       packetMentionsFocusEntity(packet, terms),
     ),
   };
-  return hasFocusedEvidence(focused) ? focused : bundle;
+  return hasFocusedEvidence(focused)
+    ? focused
+    : {
+        ...focused,
+        diagnostics: [...bundle.diagnostics, "target-entity-no-focused-evidence"],
+      };
 }
 
 export function assessNativeContextEligibility(
@@ -520,6 +525,10 @@ export function assessNativeContextEligibility(
   const bestScore = bestInjectedPacketScore(packets);
   if (packets.some((packet) => packetMentionsSuppressedEntity(packet, queryAnalysis))) {
     return { eligible: false, reason: "suppressed-entity-anchor", bestScore };
+  }
+  const focusTerms = entityFocusTerms(queryAnalysis);
+  if (focusTerms.length > 0 && !packets.some((packet) => packetMentionsFocusEntity(packet, focusTerms))) {
+    return { eligible: false, reason: "target-entity-mismatch", bestScore };
   }
   const enoughEvidence = packets.some(packetIsStrongNativeContextEvidence);
   if (enoughEvidence) {

@@ -488,6 +488,7 @@ function promptEvidenceRequiresAnswerSlotSupport(queryAnalysis) {
 	return operationType === "return_value" || answerMode === "single_fact" || answerMode === "attribute_lookup";
 }
 function isGenericRequiredField(key) {
+	const normalizedKey = normalizeText(key).replace(/[\s-]+/g, "_");
 	return [
 		"answer_value",
 		"attribute_value",
@@ -497,7 +498,7 @@ function isGenericRequiredField(key) {
 		"preference_or_prior_action",
 		"source_evidence",
 		"query_context"
-	].includes(key);
+	].includes(normalizedKey);
 }
 function slotCoverageForText(queryAnalysis, text) {
 	return (queryAnalysis.evidencePlan?.slots ?? []).map((slot) => {
@@ -1489,9 +1490,17 @@ function buildPromptEvidenceCandidates(params) {
 		...params.candidateGenerationResult?.bridgeCandidates ?? []
 	];
 	for (const hit of candidateHits) {
+		if (uniqueNonEmpty([
+			hit.docId,
+			hit.candidateId,
+			hit.lineage.canonicalId,
+			hit.lineage.sourceId
+		].filter((id) => typeof id === "string" && id.trim().length > 0)).some((id) => params.suppressedCandidateIds?.has(id))) continue;
 		const surface = candidateSurfaceToPromptSurface(hit.surface);
 		if (!surface) continue;
 		const metadata = hydrateFactCandidateMetadata(params.store, hit);
+		const observedAt = typeof metadata?.observedAt === "string" ? Date.parse(metadata.observedAt) : NaN;
+		if (typeof params.suppressCandidateEvidenceBeforeMs === "number" && Number.isFinite(observedAt) && observedAt < params.suppressCandidateEvidenceBeforeMs) continue;
 		if (hit.surface === "fact" && !factCandidateVisibleForQuery(params.queryAnalysis, metadata)) continue;
 		const text = cleanPromptEvidenceText(candidateDisplayText(hit, metadata));
 		const scoringText = promptEvidenceScoringTextFromMetadata(text, metadata);
@@ -1805,6 +1814,59 @@ function buildSupportRefChunkRows(params) {
 		if (right.anchorScore !== left.anchorScore) return right.anchorScore - left.anchorScore;
 		return (right.row.score ?? 0) - (left.row.score ?? 0);
 	}).map((entry) => entry.row), params.limit);
+}
+function queryEntityAnchorTerms(queryAnalysis) {
+	return uniqueNonEmpty((queryAnalysis.queryEntities ?? []).map((entity) => entity.name).filter((value) => typeof value === "string" && value.trim().length > 0));
+}
+function queryAttributeAnchorTerms(queryAnalysis) {
+	const entityTerms = new Set(queryEntityAnchorTerms(queryAnalysis).map((entry) => normalizeText(entry)));
+	const slotTerms = (queryAnalysis.evidencePlan?.slots ?? []).flatMap((slot) => [
+		slot.description,
+		...slot.relationHints ?? [],
+		...slot.capabilityQueries ?? [],
+		...slot.requiredFields
+	]);
+	const goalTerms = (queryAnalysis.evidenceGoals ?? []).flatMap((goal) => [
+		goal.goal,
+		...goal.positiveQueries ?? [],
+		...goal.focusAnchors ?? []
+	]);
+	return uniqueNonEmpty([
+		...queryAnalysis.anchors ?? [],
+		...slotTerms,
+		...goalTerms
+	], 24).filter((term) => {
+		const normalized = normalizeText(term);
+		return normalized && !entityTerms.has(normalized) && !isGenericRequiredField(normalized) && isMeaningfulRecallAnchor(term);
+	});
+}
+function rowMentionsQueryEntity(row, entityTerms) {
+	if (entityTerms.length === 0) return true;
+	const normalizedText = normalizeText(row.text);
+	return entityTerms.some((term) => {
+		const normalized = normalizeText(term);
+		return normalized.length > 0 && (normalizedText.includes(normalized) || projectNamesMatch(row.text, term) || semanticTextSimilarity(row.text, term) >= .46);
+	});
+}
+function rowSupportsQueryAttribute(row, attributeTerms) {
+	if (attributeTerms.length === 0) return true;
+	return Math.max(queryAnchorSupport(row.text, attributeTerms), ...attributeTerms.map((term) => semanticTextSimilarity(row.text, term))) >= .24;
+}
+function observedAtMs(row) {
+	const parsed = row.observedAt ? Date.parse(row.observedAt) : NaN;
+	return Number.isFinite(parsed) ? parsed : 0;
+}
+function shouldApplyNewerSourceFactGuard(queryAnalysis) {
+	const operation = queryAnalysis.evidencePlan?.operation.type;
+	return queryAnalysis.queryShape.timeframe === "current" && (queryAnalysis.queryShape.granularity === "exact_detail" || queryAnalysis.answerGranularity === "detail") && (operation === "return_value" || queryAnalysis.answerMode === "attribute_lookup" || queryAnalysis.answerMode === "single_fact");
+}
+function newerSourceRowsForCurrentFactGuard(params) {
+	if (!shouldApplyNewerSourceFactGuard(params.queryAnalysis) || params.facts.length === 0) return [];
+	const newestFactObservedAt = Math.max(0, ...params.facts.map((row) => observedAtMs(row)));
+	if (newestFactObservedAt <= 0) return [];
+	const entityTerms = queryEntityAnchorTerms(params.queryAnalysis);
+	const attributeTerms = queryAttributeAnchorTerms(params.queryAnalysis);
+	return dedupeEvidenceRows(params.sourceRows.filter((row) => observedAtMs(row) > newestFactObservedAt).filter((row) => !isQuestionLike(row.text)).filter((row) => rowMentionsQueryEntity(row, entityTerms)).filter((row) => rowSupportsQueryAttribute(row, attributeTerms)).sort((left, right) => observedAtMs(right) - observedAtMs(left) || (right.score ?? 0) - (left.score ?? 0)), 3);
 }
 function mergeRecalledChunkSupport(params) {
 	const merged = [];
@@ -2588,6 +2650,9 @@ async function retrieveEvidence(store, ctx, query, searchQuery = query, auditOpt
 		facts = factualFacts;
 	}
 	const scheduledFactRows = facts.slice();
+	let currentFactGuardSourceRows = [];
+	const suppressedPromptEvidenceCandidateIds = /* @__PURE__ */ new Set();
+	let suppressPromptEvidenceBeforeMs;
 	if (candidateGenerationResult && shouldApplyCandidateAuthorityToMainSurface(route, queryAnalysis)) {
 		const candidateFactLimit = shouldUseExactSnippetSupport(queryAnalysis) ? 8 : 6;
 		const candidateStateRows = prioritizeCandidateRowsForMainSurface(primaryCandidateRowsForSurface(candidateGenerationResult, "state"), queryAnchors, 4);
@@ -2597,6 +2662,7 @@ async function retrieveEvidence(store, ctx, query, searchQuery = query, auditOpt
 		}), queryAnchors, candidateFactLimit);
 		const candidateEventRows = prioritizeCandidateRowsForMainSurface(primaryCandidateRowsForSurface(candidateGenerationResult, "event"), queryAnchors, Math.max(4, ctx.config.advanced.recallChunkBudget));
 		const candidateChunkRows = prioritizeCandidateRowsForMainSurface(primaryCandidateRowsForSurface(candidateGenerationResult, "chunk").filter((entry) => entry.provenance !== "assistant"), queryAnchors, Math.max(3, Math.min(6, ctx.config.advanced.recallChunkBudget)));
+		currentFactGuardSourceRows = [...candidateEventRows, ...candidateChunkRows];
 		if (candidateStateRows.length > 0) {
 			states = candidateStateRows;
 			diagnostics.push("candidate-authority:state-main");
@@ -2609,6 +2675,23 @@ async function retrieveEvidence(store, ctx, query, searchQuery = query, auditOpt
 			events = dedupeEvidenceRows([...candidateEventRows, ...candidateChunkRows], Math.max(4, ctx.config.advanced.recallChunkBudget));
 			diagnostics.push("candidate-authority:event-main");
 		}
+	}
+	const newerCurrentSourceRows = newerSourceRowsForCurrentFactGuard({
+		facts,
+		sourceRows: currentFactGuardSourceRows,
+		queryAnalysis
+	});
+	if (newerCurrentSourceRows.length > 0) {
+		for (const fact of facts) for (const id of uniqueNonEmpty([
+			fact.id,
+			fact.id.startsWith("fact:") ? fact.id.slice(5) : `fact:${fact.id}`,
+			fact.lineage?.canonicalId,
+			fact.lineage?.sourceId
+		])) suppressedPromptEvidenceCandidateIds.add(id);
+		suppressPromptEvidenceBeforeMs = Math.min(...newerCurrentSourceRows.map((row) => observedAtMs(row)));
+		facts = [];
+		events = dedupeEvidenceRows([...newerCurrentSourceRows, ...events.filter((row) => observedAtMs(row) >= (suppressPromptEvidenceBeforeMs ?? 0))], Math.max(4, ctx.config.advanced.recallChunkBudget));
+		diagnostics.push("newer-source-evidence-suppressed-stale-current-fact");
 	}
 	const complementaryFactRows = selectComplementaryFactRowsForMainSurface({
 		store,
@@ -2724,7 +2807,9 @@ async function retrieveEvidence(store, ctx, query, searchQuery = query, auditOpt
 			facts,
 			events,
 			controlEvidence,
-			selectedExactSnippets
+			selectedExactSnippets,
+			suppressedCandidateIds: suppressedPromptEvidenceCandidateIds,
+			suppressCandidateEvidenceBeforeMs: suppressPromptEvidenceBeforeMs
 		}),
 		now: ctx.now
 	});

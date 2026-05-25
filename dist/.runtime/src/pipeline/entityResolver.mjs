@@ -3,6 +3,40 @@ import { projectAliasVariants, projectIdentityKey } from "./projectIdentity.mjs"
 import { refreshEntityProfileDocs } from "./entityProfile.mjs";
 import { semanticTextSimilarity } from "./semantic/textSimilarity.mjs";
 //#region src/pipeline/entityResolver.ts
+const LATIN_ENTITY_DESCRIPTOR_WORDS = new Set([
+	"api",
+	"app",
+	"billing",
+	"cache",
+	"client",
+	"component",
+	"database",
+	"db",
+	"engine",
+	"gateway",
+	"module",
+	"package",
+	"payment",
+	"pipeline",
+	"platform",
+	"plugin",
+	"project",
+	"queue",
+	"repo",
+	"repository",
+	"service",
+	"server",
+	"storage",
+	"system",
+	"tool",
+	"webhook",
+	"webhooks",
+	"worker",
+	"workspace"
+]);
+const CJK_FAMILY_RE = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
+const LATIN_TOKEN_RE = /[A-Za-z][A-Za-z0-9_.-]{2,}/gu;
+const CAMEL_OR_CODE_RE = /(?:[A-Z][a-z0-9]+[A-Z][A-Za-z0-9]*|[A-Za-z]+[0-9][A-Za-z0-9]*|[A-Za-z0-9]+[_.-][A-Za-z0-9_.-]+)/u;
 function typedEntityId(normalizedText, proposedType) {
 	if (proposedType === "unknown") return stableHash(["entity", normalizedText]);
 	return stableHash([
@@ -166,11 +200,67 @@ function stringArray(value) {
 	if (!Array.isArray(value)) return [];
 	return value.filter((entry) => typeof entry === "string" && entry.trim().length > 0);
 }
+function isDescriptorToken(value) {
+	return LATIN_ENTITY_DESCRIPTOR_WORDS.has(normalizeText(value));
+}
+function entityIdentityAnchorsFromText(value) {
+	const anchors = /* @__PURE__ */ new Set();
+	const rawTokens = value.match(LATIN_TOKEN_RE) ?? [];
+	const hasCjk = CJK_FAMILY_RE.test(value);
+	for (const token of rawTokens) {
+		const normalized = normalizeName(token);
+		if (normalized.length < 3 || isDescriptorToken(normalized)) continue;
+		if (CAMEL_OR_CODE_RE.test(token) || hasCjk) anchors.add(normalized);
+	}
+	return [...anchors];
+}
+function entityIdentityAnchors(entity) {
+	return [...new Set([
+		entity.canonicalName,
+		entity.normalizedName,
+		...entity.aliases
+	].flatMap((entry) => entityIdentityAnchorsFromText(entry)))];
+}
+function identityAnchorCandidates(store, mention) {
+	const mentionAnchors = entityIdentityAnchorsFromText(mention.rawText);
+	if (mentionAnchors.length === 0) return [];
+	const candidates = /* @__PURE__ */ new Map();
+	for (const anchor of mentionAnchors) for (const entity of store.graphRepo.searchEntitiesByQuery(anchor, 12)) {
+		const entityAnchors = new Set(entityIdentityAnchors(entity));
+		if (!entityAnchors.has(anchor)) continue;
+		const typeCompatibility = typeCompatibilityScore(mention, entity);
+		if (typeCompatibility === 0) continue;
+		const exact = exactNameScore(mention, entity);
+		const alias = aliasScore(mention, entity);
+		const candidate = {
+			entity,
+			score: clamp01(.62 + typeCompatibility * .14 + entity.confidence * .1 + (exact > 0 ? .08 : 0) + (alias > 0 ? .06 : 0)),
+			exactNameScore: exact,
+			aliasScore: alias,
+			embeddingScore: 0,
+			typeCompatibility,
+			scopeSessionTaskFit: .72,
+			cooccurrenceOverlap: 0,
+			graphNeighborhoodOverlap: 0,
+			recency: .5,
+			contradictionPenalty: 0,
+			source: "identity_anchor",
+			metadataJson: {
+				sharedAnchor: anchor,
+				mentionAnchors,
+				entityAnchors: [...entityAnchors]
+			}
+		};
+		const existing = candidates.get(entity.entityId);
+		if (!existing || candidate.score > existing.score) candidates.set(entity.entityId, candidate);
+	}
+	return [...candidates.values()].sort((left, right) => right.score - left.score).slice(0, 6);
+}
 function persistResolution(store, ctx, result) {
 	store.graphRepo.upsertEntity(result.entity);
 	store.graphRepo.upsertEntityMention(result.mention);
 	const normalizedAlias = normalizeName(result.mention.rawText);
-	if (normalizedAlias && normalizedAlias !== result.entity.normalizedName && (result.method === "alias" || result.method === "project_identity" || result.method === "identity_link" || result.method === "llm_candidate")) store.graphRepo.upsertEntityAliasSource({
+	if (normalizedAlias && normalizedAlias !== result.entity.normalizedName && (result.method === "alias" || result.method === "project_identity" || result.method === "identity_anchor" || result.method === "identity_link" || result.method === "llm_candidate")) store.graphRepo.upsertEntityAliasSource({
 		entityId: result.entity.entityId,
 		aliasText: result.mention.rawText,
 		sourceRef: result.mention.sourceRef,
@@ -336,6 +426,21 @@ function resolveEntityMention(store, ctx, mention, options = {}) {
 			entity: projectCandidate,
 			method: "project_identity",
 			confidence: Math.max(.76, projectCandidate.confidence)
+		});
+		if (persist) persistResolution(store, ctx, result);
+		return result;
+	}
+	const anchoredCandidates = identityAnchorCandidates(store, mention);
+	const topAnchorCandidate = anchoredCandidates[0];
+	const secondAnchorCandidate = anchoredCandidates[1];
+	if (topAnchorCandidate && topAnchorCandidate.score >= .8 && (!secondAnchorCandidate || topAnchorCandidate.score - secondAnchorCandidate.score >= .08)) {
+		const result = resolutionResult({
+			mention,
+			entity: topAnchorCandidate.entity,
+			method: "identity_anchor",
+			confidence: Math.max(.8, topAnchorCandidate.score),
+			candidateEntityIds: anchoredCandidates.map((candidate) => candidate.entity.entityId),
+			candidates: anchoredCandidates
 		});
 		if (persist) persistResolution(store, ctx, result);
 		return result;

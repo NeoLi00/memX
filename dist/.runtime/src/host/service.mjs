@@ -2,7 +2,7 @@ import { normalizeName, nowIso, randomId, stableHash, truncateText } from "../su
 import { normalizeObservePayload } from "./hookPayload.mjs";
 import { DEFAULT_MEMORY_CONFIG, memxConfigSchema } from "../config.mjs";
 import { compileQuery } from "../pipeline/queryCompiler.mjs";
-import { retrieveEvidence } from "../pipeline/retrieve.mjs";
+import { renderEvidenceBundle, retrieveEvidence } from "../pipeline/retrieve.mjs";
 import { captureAgentEndTurn } from "../pipeline/turnCapture.mjs";
 import { resolveDefaultScope } from "../security/scopes.mjs";
 import { MemxRuntimeManager, buildOperationContext } from "../runtime.mjs";
@@ -98,34 +98,13 @@ function countTable(store, table) {
 	const row = store.client.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get();
 	return Number(row?.count ?? 0);
 }
-function formatEvidenceRows(title, rows, limit) {
-	const usableRows = rows.filter((row) => typeof row.text === "string" && row.text.trim().length > 0);
-	if (usableRows.length === 0) return [];
-	return [`## ${title}`, ...usableRows.slice(0, limit).map((row) => {
-		const date = row.observedAt ? ` [${row.observedAt.slice(0, 10)}]` : "";
-		return `- ${truncateText(row.text ?? "", 360)}${date}`;
-	})];
-}
 function graphPathText(path) {
 	if (typeof path === "string") return path;
 	if (isRecord(path) && typeof path.summary === "string") return path.summary;
 	return "";
 }
-function formatRecallContext(bundle, limit) {
-	const graphPaths = Array.isArray(bundle.graph?.paths) ? bundle.graph.paths : [];
-	const evidenceLines = [
-		...formatEvidenceRows("Guidance", bundle.behavioralGuidance.map((text) => ({ text })), Math.min(limit, 4)),
-		...formatEvidenceRows("State", bundle.states, limit),
-		...formatEvidenceRows("Facts", bundle.facts, limit),
-		...formatEvidenceRows("Events", bundle.events, limit),
-		...formatEvidenceRows("Graph", graphPaths.map((path) => ({ text: graphPathText(path) })), Math.min(limit, 4))
-	].filter((line) => line.trim().length > 0);
-	if (evidenceLines.length === 0) return "";
-	return [
-		"## memX Memory",
-		"Use the following remembered context only when it directly helps the current request.",
-		...evidenceLines
-	].join("\n");
+function formatNativeRecallContext(bundle, maxChars) {
+	return renderEvidenceBundle(bundle, maxChars);
 }
 function injectedPackets(bundle) {
 	return bundle.evidencePackets.filter((packet) => packet.injected && !packet.dropReason);
@@ -133,36 +112,15 @@ function injectedPackets(bundle) {
 function bestInjectedPacketScore(packets) {
 	return packets.reduce((best, packet) => Math.max(best, packet.grade?.finalScore ?? packet.score ?? packet.coverage.confidence ?? 0), 0);
 }
-function bestEvidenceRowScore(rows) {
-	return rows.reduce((best, row) => Math.max(best, typeof row.score === "number" && Number.isFinite(row.score) ? row.score : 0, typeof row.confidence === "number" && Number.isFinite(row.confidence) ? row.confidence : 0), 0);
+function packetHasNativeAnswerSurface(packet) {
+	if (packet.role === "answer" || packet.eligibility?.role === "answer") return true;
+	return (packet.displayLines && packet.displayLines.length > 0 ? packet.displayLines : [packet.primaryText]).some((line) => line.startsWith("[answer]") || line.startsWith("[resource]") || packet.operationType === "aggregate" && line.startsWith("[event]"));
 }
-function directEvidenceEligibility(bundle) {
-	const states = Array.isArray(bundle.states) ? bundle.states : [];
-	const facts = Array.isArray(bundle.facts) ? bundle.facts : [];
-	const graphPaths = Array.isArray(bundle.graph?.paths) ? bundle.graph.paths : [];
-	const behavioralGuidance = Array.isArray(bundle.behavioralGuidance) ? bundle.behavioralGuidance : [];
-	const events = Array.isArray(bundle.events) ? bundle.events : [];
-	const promptEvidence = Array.isArray(bundle.promptEvidence) ? bundle.promptEvidence : [];
-	const routeConfidence = typeof bundle.routeConfidence === "number" && Number.isFinite(bundle.routeConfidence) ? bundle.routeConfidence : 0;
-	const structuredRows = [...states, ...facts];
-	if (structuredRows.length > 0) return {
-		eligible: true,
-		reason: "direct-structured-evidence",
-		bestScore: Math.max(bestEvidenceRowScore(structuredRows), routeConfidence)
-	};
-	if (graphPaths.length > 0 || behavioralGuidance.length > 0) return {
-		eligible: true,
-		reason: "direct-graph-or-guidance-evidence",
-		bestScore: routeConfidence
-	};
-	const sourceRows = [...events, ...promptEvidence];
-	const bestSourceScore = bestEvidenceRowScore(sourceRows);
-	if (sourceRows.length > 0 && (bestSourceScore >= .25 || routeConfidence >= .35)) return {
-		eligible: true,
-		reason: "direct-source-evidence",
-		bestScore: Math.max(bestSourceScore, routeConfidence)
-	};
-	return null;
+function packetIsStrongNativeContextEvidence(packet) {
+	const score = packet.grade?.finalScore ?? packet.score ?? packet.coverage.confidence ?? 0;
+	const slotCoverage = packet.grade?.slotCoverageScore ?? (packet.coverage.filled ? packet.coverage.confidence : 0);
+	const contextBinding = packet.grade?.contextBindingScore ?? (packet.coverage.filled ? packet.coverage.confidence : 0);
+	return packetHasSourceGroundedEvidence(packet) && packetHasNativeAnswerSurface(packet) && packet.coverage.missing.length === 0 && score >= .62 && slotCoverage >= .45 && contextBinding >= .42;
 }
 function appendStagedPendingEvidence(bundle, stagedTurns, ctx) {
 	if (stagedTurns.length === 0) return bundle;
@@ -180,9 +138,50 @@ function appendStagedPendingEvidence(bundle, stagedTurns, ctx) {
 			sourceRef: `pending-staged:${turn.turnId}`
 		}
 	}));
+	const stagedPackets = stagedRows.map((row) => ({
+		packetId: row.id,
+		slotId: "pending-staged-turn",
+		operationType: "return_value",
+		role: "answer",
+		protected: true,
+		injected: true,
+		layers: ["chunk"],
+		primaryText: row.text,
+		supportingTexts: [],
+		sourceRefs: [row.sourceRef],
+		allSourceRefs: [row.sourceRef],
+		score: row.score,
+		scoreBreakdown: {
+			stagedPendingTurn: true,
+			retrievalScore: row.score
+		},
+		displayLines: [`[answer] ${truncateText(row.text, 360)}`],
+		observedAt: row.observedAt,
+		authorRoles: ["user", "assistant"],
+		coverage: {
+			filled: true,
+			missing: [],
+			confidence: row.confidence
+		},
+		eligibility: {
+			eligible: true,
+			role: "answer",
+			blockers: []
+		},
+		grade: {
+			retrievalScore: row.score,
+			answerScore: row.score,
+			contextBindingScore: row.score,
+			slotCoverageScore: row.score,
+			authorityScore: .72,
+			finalScore: row.score
+		},
+		selectionReason: "pending staged turn evidence while semantic write is still queued"
+	}));
 	return {
 		...bundle,
 		events: [...stagedRows, ...bundle.events],
+		evidencePackets: [...stagedPackets, ...bundle.evidencePackets],
 		recalledChunkTexts: [...stagedRows.map((row) => row.text), ...bundle.recalledChunkTexts],
 		diagnostics: [...bundle.diagnostics, "pending-staged-turn-evidence"]
 	};
@@ -266,7 +265,7 @@ function focusRecallBundleForQueryEntities(queryAnalysis, bundle) {
 }
 function assessNativeContextEligibility(_query, queryAnalysis, bundle) {
 	const packets = injectedPackets(bundle);
-	if (packets.length === 0) return directEvidenceEligibility(bundle) ?? {
+	if (packets.length === 0) return {
 		eligible: false,
 		reason: "no-injected-packets",
 		bestScore: 0
@@ -277,25 +276,10 @@ function assessNativeContextEligibility(_query, queryAnalysis, bundle) {
 		reason: "suppressed-entity-anchor",
 		bestScore
 	};
-	if (bestScore >= .62 || bundle.routeConfidence >= .68 || packets.some((packet) => packet.coverage.filled && packet.coverage.confidence >= .58)) return {
+	if (packets.some(packetIsStrongNativeContextEvidence)) return {
 		eligible: true,
 		reason: queryAnalysis.queryEntities.length > 0 ? "llm-query-entities" : "strong-evidence",
 		bestScore
-	};
-	if (queryAnalysis.queryEntities.length > 0 && packets.some((packet) => packet.coverage.filled || (packet.coverage.confidence ?? 0) >= .35)) return {
-		eligible: true,
-		reason: "entity-supported-evidence",
-		bestScore
-	};
-	if (packets.some((packet) => packetHasSourceGroundedEvidence(packet) && (packet.grade?.finalScore ?? packet.score ?? 0) >= .32 && packet.coverage.confidence >= .35)) return {
-		eligible: true,
-		reason: "assembled-source-evidence",
-		bestScore
-	};
-	const directEligibility = directEvidenceEligibility(bundle);
-	if (directEligibility) return {
-		...directEligibility,
-		bestScore: Math.max(directEligibility.bestScore, bestScore)
 	};
 	return {
 		eligible: false,
@@ -431,12 +415,13 @@ var MemxHostService = class {
 		const contextEligibility = assessNativeContextEligibility(request.query, compiled, focusedBundle);
 		const graphPaths = Array.isArray(focusedBundle.graph?.paths) ? focusedBundle.graph.paths : [];
 		const graphEdges = Array.isArray(focusedBundle.graph?.edges) ? focusedBundle.graph.edges : [];
+		const nativeContext = formatNativeRecallContext(focusedBundle, this.config.maxInjectedChars);
 		return {
 			ok: true,
 			routeType: focusedBundle.routeType,
 			routeConfidence: focusedBundle.routeConfidence,
 			focusedQuery: compiled.focusedQuery,
-			context: formatRecallContext(focusedBundle, limit),
+			context: nativeContext,
 			contextEligibility,
 			states: focusedBundle.states.slice(0, limit),
 			facts: focusedBundle.facts.slice(0, limit),
@@ -508,11 +493,13 @@ var MemxHostService = class {
 			id
 		};
 	}
-	async stats() {
+	async stats(request = {}) {
 		const ctx = asEnvelopeContext(this.config, {
-			hostId: "generic",
-			actorId: process.env["MEMX_ACTOR_ID"] || "memx-shared",
-			sessionId: "stats"
+			hostId: request.hostId === "codex" || request.hostId === "claude-code" ? request.hostId : "generic",
+			actorId: request.actorId || process.env["MEMX_ACTOR_ID"] || "memx-shared",
+			sessionId: request.sessionId || "stats",
+			workspaceDir: request.workspaceDir,
+			project: request.project
 		});
 		const store = await this.manager.getStore(ctx);
 		return {
@@ -529,17 +516,36 @@ var MemxHostService = class {
 			vectorDocCount: countTable(store, "vector_docs")
 		};
 	}
-	async audit(limit = 50) {
+	async audit(limit = 50, request = {}) {
 		const ctx = asEnvelopeContext(this.config, {
-			hostId: "generic",
-			actorId: process.env["MEMX_ACTOR_ID"] || "memx-shared",
-			sessionId: "audit"
+			hostId: request.hostId === "codex" || request.hostId === "claude-code" ? request.hostId : "generic",
+			actorId: request.actorId || process.env["MEMX_ACTOR_ID"] || "memx-shared",
+			sessionId: request.sessionId || "audit",
+			workspaceDir: request.workspaceDir,
+			project: request.project
 		});
+		const store = await this.manager.getStore(ctx);
+		const boundedLimit = Math.max(1, Math.min(Math.trunc(limit), 200));
 		return {
 			ok: true,
-			signals: (await this.manager.getStore(ctx)).auditRepo.listSignals({
+			agentId: ctx.agentId,
+			dbPath: ctx.dbPath,
+			scopes: ctx.scopes,
+			signals: store.auditRepo.listSignals({
 				agentId: ctx.agentId,
-				limit: Math.max(1, Math.min(Math.trunc(limit), 200))
+				limit: boundedLimit
+			}),
+			retrievals: store.auditRepo.listRetrievals({
+				agentId: ctx.agentId,
+				limit: boundedLimit
+			}),
+			policyDecisions: store.auditRepo.listPolicyDecisions({
+				agentId: ctx.agentId,
+				limit: boundedLimit
+			}),
+			maintenanceRuns: store.auditRepo.listMaintenanceRuns({
+				agentId: ctx.agentId,
+				limit: boundedLimit
 			})
 		};
 	}
@@ -622,4 +628,4 @@ function stableHostTurnId(envelope) {
 	]);
 }
 //#endregion
-export { MemxHostService, assessNativeContextEligibility, createServiceConfigFromEnv, focusRecallBundleForQueryEntities, stableHostTurnId };
+export { MemxHostService, assessNativeContextEligibility, createServiceConfigFromEnv, focusRecallBundleForQueryEntities, formatNativeRecallContext, stableHostTurnId };

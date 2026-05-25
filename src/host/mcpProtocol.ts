@@ -51,6 +51,9 @@ export const MEMX_MCP_TOOLS: McpTool[] = [
       properties: {
         query: stringProp("Focused recall query."),
         limit: numberProp("Maximum number of returned items."),
+        hostId: stringProp("Optional host identifier such as codex or claude-code."),
+        actorId: stringProp("Optional actor identifier."),
+        sessionId: stringProp("Optional host session identifier."),
       },
       required: ["query"],
     },
@@ -63,6 +66,9 @@ export const MEMX_MCP_TOOLS: McpTool[] = [
       properties: {
         content: stringProp("Memory content to store."),
         type: stringProp("Optional memory type hint."),
+        hostId: stringProp("Optional host identifier such as codex or claude-code."),
+        actorId: stringProp("Optional actor identifier."),
+        sessionId: stringProp("Optional host session identifier."),
       },
       required: ["content"],
     },
@@ -93,16 +99,26 @@ export const MEMX_MCP_TOOLS: McpTool[] = [
   },
   {
     name: "memx_stats",
-    description: "Return memX store statistics for the current shared actor.",
-    inputSchema: { type: "object", properties: {} },
+    description: "Return memX store statistics for the requested host-scoped actor.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        hostId: stringProp("Optional host identifier such as codex or claude-code."),
+        actorId: stringProp("Optional actor identifier."),
+        sessionId: stringProp("Optional host session identifier."),
+      },
+    },
   },
   {
     name: "memx_audit",
-    description: "Return recent memX audit signals and maintenance activity.",
+    description: "Return recent memX audit signals and maintenance activity for the requested host-scoped actor.",
     inputSchema: {
       type: "object",
       properties: {
         limit: numberProp("Maximum number of audit rows."),
+        hostId: stringProp("Optional host identifier such as codex or claude-code."),
+        actorId: stringProp("Optional actor identifier."),
+        sessionId: stringProp("Optional host session identifier."),
       },
     },
   },
@@ -159,6 +175,18 @@ function callBody(args: Record<string, unknown>, extra?: Record<string, unknown>
   };
 }
 
+function hostScopedQuery(args: Record<string, unknown>, keys = ["hostId", "actorId", "sessionId"]): string {
+  const params = new URLSearchParams();
+  for (const key of keys) {
+    const value = args[key];
+    if (typeof value === "string" && value.trim()) {
+      params.set(key, value.trim());
+    }
+  }
+  const query = params.toString();
+  return query ? `?${query}` : "";
+}
+
 function pathForTool(name: string, args: Record<string, unknown>): { path: string; init: RequestInit } {
   switch (name) {
     case "memx_recall":
@@ -170,10 +198,14 @@ function pathForTool(name: string, args: Record<string, unknown>): { path: strin
     case "memx_forget":
       return { path: "/v1/forget", init: callBody(args) };
     case "memx_stats":
-      return { path: "/v1/stats", init: { method: "GET" } };
+      return { path: `/v1/stats${hostScopedQuery(args)}`, init: { method: "GET" } };
     case "memx_audit": {
       const limit = typeof args.limit === "number" ? Math.trunc(args.limit) : 50;
-      return { path: `/v1/audit?limit=${Math.max(1, Math.min(limit, 200))}`, init: { method: "GET" } };
+      const query = hostScopedQuery({
+        ...args,
+        limit: String(Math.max(1, Math.min(limit, 200))),
+      }, ["limit", "hostId", "actorId", "sessionId"]);
+      return { path: `/v1/audit${query}`, init: { method: "GET" } };
     }
     default:
       throw new Error(`unknown tool: ${name}`);

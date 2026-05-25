@@ -687,6 +687,7 @@ export type EntityResolutionMethod =
   | "exact"
   | "alias"
   | "project_identity"
+  | "identity_anchor"
   | "cooccurrence"
   | "embedding_candidate"
   | "llm_candidate"
@@ -767,7 +768,7 @@ export type EntityResolutionCandidate = {
   graphNeighborhoodOverlap: number;
   recency: number;
   contradictionPenalty: number;
-  source: "profile_vector" | "name_search" | "mention_history";
+  source: "profile_vector" | "identity_anchor" | "name_search" | "mention_history";
   metadataJson?: Record<string, unknown>;
 };
 

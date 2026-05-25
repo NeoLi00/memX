@@ -359,6 +359,15 @@ function entityExpansionTextMatches(entity, text) {
 		...entity.aliases
 	].map((value) => normalizeText(value)).filter(Boolean).some((alias) => alias.length > 0 && haystack.includes(alias));
 }
+function factSupportText(fact) {
+	const assertion = fact.objectValueJson?.semanticAssertion && typeof fact.objectValueJson.semanticAssertion === "object" ? fact.objectValueJson.semanticAssertion : void 0;
+	const assertionSupportText = typeof assertion?.supportText === "string" ? assertion.supportText.trim() : "";
+	if (assertionSupportText) return assertionSupportText;
+	return (typeof fact.objectValueJson?.supportText === "string" ? fact.objectValueJson.supportText.trim() : "") || fact.provenanceText?.trim() || void 0;
+}
+function factSupportSourceRefs(fact) {
+	return uniqueMaintenanceRefs([...sourceRefsFromMaintenanceMetadata(fact.objectValueJson), fact.sourceRef]);
+}
 function factCandidatesForEntity(store, ctx, entity, limit) {
 	const subjects = [
 		entity.normalizedName,
@@ -371,41 +380,52 @@ function factCandidatesForEntity(store, ctx, entity, limit) {
 		scope,
 		canonicalSubject: subject
 	})) facts.set(fact.factId, fact);
-	return [...facts.values()].sort((left, right) => right.confidence - left.confidence || Date.parse(right.updatedAt) - Date.parse(left.updatedAt)).slice(0, limit).map((fact) => ({
-		candidateId: `fact:${fact.factId}:entity-expansion`,
-		surface: "fact",
-		tier: "primary",
-		text: formatFactLine({
-			subject: entity.canonicalName,
-			predicate: fact.predicate,
-			object: fact.canonicalObject,
-			objectValueJson: fact.objectValueJson,
-			status: fact.status
-		}),
-		score: clamp01(fact.confidence * .72 + entity.confidence * .18 + .1),
-		retrievalBackend: "repo",
-		docId: fact.factId,
-		scope: fact.scope,
-		agentId: ctx.agentId,
-		confidence: fact.confidence,
-		currentnessHint: fact.status === "active" ? "current" : "unknown",
-		lineage: {
-			sourceKind: "fact",
-			sourceId: fact.factId,
-			sourceRef: fact.sourceRef,
-			canonicalKind: "fact",
-			canonicalId: fact.factId,
-			...typeof fact.materializedEpoch === "number" ? { materializedEpoch: fact.materializedEpoch } : {}
-		},
-		metadata: {
-			entityExpansion: true,
-			expandedEntityId: entity.entityId,
-			sourceRef: fact.sourceRef,
-			predicate: fact.predicate,
+	return [...facts.values()].sort((left, right) => right.confidence - left.confidence || Date.parse(right.updatedAt) - Date.parse(left.updatedAt)).slice(0, limit).map((fact) => {
+		const sourceRefs = factSupportSourceRefs(fact);
+		const sourceRef = sourceRefs[0] ?? fact.sourceRef;
+		const supportText = factSupportText(fact);
+		return {
+			candidateId: `fact:${fact.factId}:entity-expansion`,
+			surface: "fact",
+			tier: "primary",
+			text: formatFactLine({
+				subject: entity.canonicalName,
+				predicate: fact.predicate,
+				object: fact.canonicalObject,
+				objectValueJson: fact.objectValueJson,
+				status: fact.status
+			}),
+			score: clamp01(fact.confidence * .72 + entity.confidence * .18 + .1),
+			retrievalBackend: "repo",
+			docId: fact.factId,
+			scope: fact.scope,
+			agentId: ctx.agentId,
+			confidence: fact.confidence,
 			currentnessHint: fact.status === "active" ? "current" : "unknown",
-			memxDocType: "fact"
-		}
-	}));
+			lineage: {
+				sourceKind: "fact",
+				sourceId: fact.factId,
+				sourceRef,
+				canonicalKind: "fact",
+				canonicalId: fact.factId,
+				...typeof fact.materializedEpoch === "number" ? { materializedEpoch: fact.materializedEpoch } : {}
+			},
+			metadata: {
+				entityExpansion: true,
+				expandedEntityId: entity.entityId,
+				sourceRef,
+				sourceRefs,
+				supportRefs: sourceRefs,
+				supportContentRefs: sourceRefs,
+				...supportText ? { supportText } : {},
+				canonicalSubject: fact.canonicalSubject,
+				...fact.canonicalObject ? { canonicalObject: fact.canonicalObject } : {},
+				predicate: fact.predicate,
+				currentnessHint: fact.status === "active" ? "current" : "unknown",
+				memxDocType: "fact"
+			}
+		};
+	});
 }
 function eventCandidatesForEntity(store, ctx, entity, limit) {
 	const events = /* @__PURE__ */ new Map();

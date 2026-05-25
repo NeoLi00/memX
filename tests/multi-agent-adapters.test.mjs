@@ -266,6 +266,93 @@ test("Codex UserPromptSubmit hook injects recalled context and defers write unti
   );
 });
 
+test("native hook reads memX URL from quickstart hook runtime config", async () => {
+  const calls = [];
+  const server = createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) {
+      chunks.push(chunk);
+    }
+    const bodyText = Buffer.concat(chunks).toString("utf8");
+    calls.push({
+      path: req.url,
+      body: bodyText ? JSON.parse(bodyText) : {},
+    });
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true, prependContext: "## memX Memory\n- hook config works" }));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const dir = mkdtempSync(join(tmpdir(), "memx-hook-config-"));
+  const hookConfigPath = join(dir, "hook-runtime.json");
+  writeFileSync(
+    hookConfigPath,
+    JSON.stringify({
+      memxUrl: `http://127.0.0.1:${address.port}`,
+      hookTimeoutMs: 2000,
+    }),
+    "utf8",
+  );
+
+  const child = spawn(
+    process.execPath,
+    [
+      join(rootPath, "dist/.runtime/src/bin/memx-hook.mjs"),
+      "codex",
+      "UserPromptSubmit",
+      "--hook-config",
+      hookConfigPath,
+    ],
+    {
+      env: {
+        ...process.env,
+        MEMX_URL: "",
+        MEMX_HOOK_TIMEOUT_MS: "",
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+    },
+  );
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    stdout += chunk;
+  });
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+  child.stdin.end(
+    JSON.stringify({
+      session_id: "codex-hook-config-session",
+      cwd: "/tmp/project",
+      prompt: "继续 hook config 验证",
+    }),
+  );
+
+  const exitCode = await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error("memx-hook config test timed out"));
+    }, 5000);
+    child.on("error", (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+    child.on("exit", (code) => {
+      clearTimeout(timeout);
+      resolve(code);
+    });
+  });
+  await new Promise((resolve) => server.close(resolve));
+
+  assert.equal(exitCode, 0, stderr);
+  assert.deepEqual(calls.map((call) => call.path), ["/v1/context"]);
+  const output = JSON.parse(stdout);
+  assert.match(output.hookSpecificOutput.additionalContext, /hook config works/);
+});
+
 test("UserPromptSubmit persists the pending user turn before slow recall can consume the hook budget", async () => {
   const calls = [];
   const server = createServer(async (req, res) => {
@@ -829,6 +916,23 @@ test("MCP handler exposes memX tools and proxies calls to REST", async () => {
   assert.equal(JSON.parse(calls[0].init.body).query, "Notebook validator");
   assert.equal(call.result.content[0].type, "text");
 
+  await handleMcpRequest(
+    {
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: {
+        name: "memx_audit",
+        arguments: { limit: 5, hostId: "codex", actorId: "memx-shared", sessionId: "s1" },
+      },
+    },
+    { proxy },
+  );
+  assert.equal(
+    calls[1].path,
+    "/v1/audit?limit=5&hostId=codex&actorId=memx-shared&sessionId=s1",
+  );
+
   const initialized = await handleMcpRequest({
     jsonrpc: "2.0",
     method: "notifications/initialized",
@@ -918,6 +1022,19 @@ test("standalone host service isolates default memory by native host", async () 
     assert.match(claude.actorId, /^claude-code--/);
     assert.equal(existsSync(join(dir, codex.actorId, "memx.sqlite")), true);
     assert.equal(existsSync(join(dir, claude.actorId, "memx.sqlite")), true);
+
+    const codexStats = await service.stats({
+      hostId: "codex",
+      actorId: "memx-shared",
+      sessionId: "stats",
+    });
+    const claudeAudit = await service.audit(10, {
+      hostId: "claude-code",
+      actorId: "memx-shared",
+      sessionId: "audit",
+    });
+    assert.equal(codexStats.agentId, codex.actorId);
+    assert.equal(claudeAudit.agentId, claude.actorId);
   } finally {
     await service.close();
   }
@@ -971,14 +1088,17 @@ test("native context injection follows retrieval evidence without a memory-inten
     supportingTexts: [],
     sourceRefs: ["user:1"],
     layers: ["chunk"],
+    displayLines: [
+      "[answer] 项目 BlueWhaleLedger 的回归校验命令是 npm run verify:ledger，幂等键字段叫 operationFingerprint，批量导入必须先跑 dry-run。",
+    ],
     coverage: { filled: true, missing: [], confidence: 0.88 },
     grade: {
-      retrievalScore: 0.08,
-      answerScore: 0.03,
-      contextBindingScore: 0.03,
-      slotCoverageScore: 0.08,
-      authorityScore: 0.08,
-      finalScore: 0.03,
+      retrievalScore: 0.82,
+      answerScore: 0.78,
+      contextBindingScore: 0.72,
+      slotCoverageScore: 0.88,
+      authorityScore: 0.8,
+      finalScore: 0.78,
     },
   };
   const weakPacket = {
@@ -1045,8 +1165,8 @@ test("native context injection follows retrieval evidence without a memory-inten
       ],
     },
   );
-  assert.equal(entitySupported.eligible, true);
-  assert.equal(entitySupported.reason, "entity-supported-evidence");
+  assert.equal(entitySupported.eligible, false);
+  assert.equal(entitySupported.reason, "weak-evidence");
 
   const suppressedAnchor = assessNativeContextEligibility(
     "现在先不谈 BlueWhaleLedger。帮我起三个 API 名字。",

@@ -145,6 +145,192 @@ function buildProjectProfileDocs(params: {
   };
 }
 
+function normalizedFactStableId(fact: NormalizedFact): string {
+  return stableHash([
+    fact.agentId,
+    fact.scope,
+    fact.canonicalSubject,
+    fact.predicate,
+    fact.canonicalObject ?? JSON.stringify(fact.objectValueJson ?? {}),
+  ]);
+}
+
+function formatFactVectorTextForWrite(fact: NormalizedFact): string {
+  return fact.canonicalObject
+    ? `${fact.canonicalSubject} ${fact.predicate} ${fact.canonicalObject}`
+    : `${fact.canonicalSubject} ${fact.predicate} ${JSON.stringify(fact.objectValueJson ?? {})}`;
+}
+
+function metadataWithoutCanonicalObject(metadata: Record<string, unknown>): Record<string, unknown> {
+  const next = { ...metadata };
+  delete next.canonicalObject;
+  return next;
+}
+
+function rewriteFactVectorDoc(
+  doc: VectorDocRecord,
+  fact: NormalizedFact,
+): VectorDocRecord {
+  const metadata = objectRecord(doc.metadataJson) ?? {};
+  const lineage = objectRecord(metadata.lineage) ?? {};
+  const sourceRef =
+    fact.sourceRef ??
+    (typeof metadata.sourceRef === "string" && metadata.sourceRef.trim()
+      ? metadata.sourceRef.trim()
+      : undefined);
+  const mergedMetadata = {
+    ...metadata,
+    canonicalSubject: fact.canonicalSubject,
+    predicate: fact.predicate,
+    ...(fact.canonicalObject ? { canonicalObject: fact.canonicalObject } : {}),
+    canonicalKind: "fact",
+    canonicalId: fact.factId,
+    sourceKind: "fact",
+    sourceId: fact.factId,
+    ...(sourceRef ? { sourceRef } : {}),
+    lineage: {
+      ...lineage,
+      canonicalKind: "fact",
+      canonicalId: fact.factId,
+      sourceKind: "fact",
+      sourceId: fact.factId,
+      ...(sourceRef ? { sourceRef } : {}),
+      ...(typeof fact.materializedEpoch === "number"
+        ? { materializedEpoch: fact.materializedEpoch }
+        : {}),
+    },
+  };
+  const nextMetadata = fact.canonicalObject
+    ? mergedMetadata
+    : metadataWithoutCanonicalObject(mergedMetadata);
+  return {
+    ...doc,
+    docId: `fact:${fact.factId}`,
+    sourceId: fact.factId,
+    text: formatFactVectorTextForWrite(fact),
+    metadataJson: nextMetadata,
+    updatedAt: fact.updatedAt,
+  };
+}
+
+function mapCanonicalInputName(
+  mappings: Map<string, string>,
+  input: string | undefined,
+  canonical: string,
+): void {
+  const inputKey = normalizeName(input ?? "");
+  const canonicalKey = normalizeName(canonical);
+  if (!inputKey || !canonicalKey) {
+    return;
+  }
+  mappings.set(inputKey, canonicalKey);
+}
+
+function rewriteFactsForResolvedEntities(
+  normalized: { facts: NormalizedFact[]; vectorDocs: VectorDocRecord[] },
+  canonicalNameByInputName: Map<string, string>,
+): void {
+  if (canonicalNameByInputName.size === 0 || normalized.facts.length === 0) {
+    return;
+  }
+  const replacementsByOldFactId = new Map<string, NormalizedFact>();
+  normalized.facts = normalized.facts.map((fact) => {
+    const canonicalSubject = canonicalNameByInputName.get(fact.canonicalSubject);
+    const canonicalObject = fact.canonicalObject
+      ? canonicalNameByInputName.get(fact.canonicalObject)
+      : undefined;
+    if (
+      (!canonicalSubject || canonicalSubject === fact.canonicalSubject) &&
+      (!canonicalObject || canonicalObject === fact.canonicalObject)
+    ) {
+      return fact;
+    }
+    const rewritten: NormalizedFact = {
+      ...fact,
+      canonicalSubject: canonicalSubject ?? fact.canonicalSubject,
+      canonicalObject: canonicalObject ?? fact.canonicalObject,
+    };
+    rewritten.factId = normalizedFactStableId(rewritten);
+    replacementsByOldFactId.set(fact.factId, rewritten);
+    return rewritten;
+  });
+  if (replacementsByOldFactId.size === 0) {
+    return;
+  }
+  normalized.vectorDocs = normalized.vectorDocs.map((doc) => {
+    if (doc.docKind !== "fact") {
+      return doc;
+    }
+    const sourceReplacement = replacementsByOldFactId.get(doc.sourceId);
+    const docReplacement =
+      sourceReplacement ??
+      (doc.docId.startsWith("fact:")
+        ? replacementsByOldFactId.get(doc.docId.slice("fact:".length))
+        : undefined);
+    return docReplacement ? rewriteFactVectorDoc(doc, docReplacement) : doc;
+  });
+}
+
+function shouldResolveFactEntityName(value: string | undefined): value is string {
+  const normalized = normalizeName(value ?? "");
+  return Boolean(normalized && normalized !== "user" && normalized !== "assistant" && normalized !== "system");
+}
+
+function addResolvedFactEntityNameMappings(
+  store: MemxStoreBundle,
+  ctx: MemoryOperationContext,
+  candidate: ClassifiedCandidate,
+  facts: NormalizedFact[],
+  canonicalNameByInputName: Map<string, string>,
+): void {
+  const sourceRef = buildSourceRef(candidate);
+  const turnIndex = candidateTurnIndex(candidate);
+  const seen = new Set<string>();
+  for (const fact of facts) {
+    for (const [role, rawName] of [
+      ["subject", fact.canonicalSubject],
+      ["object", fact.canonicalObject],
+    ] as const) {
+      if (!shouldResolveFactEntityName(rawName)) {
+        continue;
+      }
+      const normalizedName = normalizeName(rawName);
+      if (seen.has(normalizedName)) {
+        continue;
+      }
+      seen.add(normalizedName);
+      const result = resolveEntityMention(
+        store,
+        ctx,
+        buildEntityMention({
+          ctx,
+          scope: fact.scope,
+          rawText: rawName,
+          proposedType: "unknown",
+          semanticRole: role,
+          sourceRef: fact.sourceRef ?? sourceRef,
+          supportText: fact.provenanceText ?? candidate.rawText,
+          observedAt: fact.updatedAt,
+          sessionKey: candidate.source.sessionKey,
+          turnIndex,
+          metadataJson: {
+            reason: "fact-canonical-name-resolution",
+            factId: fact.factId,
+            predicate: fact.predicate,
+            role,
+          },
+        }),
+        {
+          createIfMissing: false,
+        },
+      );
+      if (result.method !== "uncertain" && result.entity.normalizedName) {
+        mapCanonicalInputName(canonicalNameByInputName, rawName, result.entity.normalizedName);
+      }
+    }
+  }
+}
+
 function buildProjectProfileEdgeDoc(edge: NormalizedGraphEdge): VectorDocRecord {
   return {
     docId: `edge:${edge.edgeId}`,
@@ -546,9 +732,14 @@ function resolveGraphEntities(
   candidate: ClassifiedCandidate,
   entities: NormalizedEntity[],
   edges: NormalizedGraphEdge[],
-): { entities: NormalizedEntity[]; edges: NormalizedGraphEdge[] } {
+): {
+  entities: NormalizedEntity[];
+  edges: NormalizedGraphEdge[];
+  canonicalNameByInputName: Map<string, string>;
+} {
+  const canonicalNameByInputName = new Map<string, string>();
   if (entities.length === 0) {
-    return { entities, edges };
+    return { entities, edges, canonicalNameByInputName };
   }
   const sourceRef = buildSourceRef(candidate);
   const turnIndex = candidateTurnIndex(candidate);
@@ -597,6 +788,12 @@ function resolveGraphEntities(
         },
       });
     }
+    mapCanonicalInputName(canonicalNameByInputName, entity.normalizedName, canonical.normalizedName);
+    mapCanonicalInputName(canonicalNameByInputName, entity.canonicalName, canonical.normalizedName);
+    mapCanonicalInputName(canonicalNameByInputName, result.mention.rawText, canonical.normalizedName);
+    for (const alias of entity.aliases) {
+      mapCanonicalInputName(canonicalNameByInputName, alias, canonical.normalizedName);
+    }
     entityIdMap.set(entity.entityId, canonical.entityId);
     canonicalEntities.set(canonical.entityId, canonical);
   }
@@ -608,6 +805,7 @@ function resolveGraphEntities(
   return {
     entities: [...canonicalEntities.values()],
     edges: rewrittenEdges,
+    canonicalNameByInputName,
   };
 }
 
@@ -772,6 +970,14 @@ export function writeCandidate(
     );
     normalized.entities = refreshedGraph.entities;
     normalized.edges = refreshedGraph.edges;
+    addResolvedFactEntityNameMappings(
+      store,
+      ctx,
+      candidate,
+      normalized.facts,
+      refreshedGraph.canonicalNameByInputName,
+    );
+    rewriteFactsForResolvedEntities(normalized, refreshedGraph.canonicalNameByInputName);
 
     for (const transition of projectStateTransitions) {
       const projectCode = projectCodeFromStateKey(transition.state.key);

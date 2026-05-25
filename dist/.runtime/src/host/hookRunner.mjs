@@ -8,23 +8,67 @@ import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 //#region src/host/hookRunner.ts
 const DEFAULT_URL = "http://127.0.0.1:3878";
 const CONTEXT_INJECTION_EVENTS = new Set(["UserPromptSubmit"]);
+function parseHookArgs(argv) {
+	const positional = [];
+	let hookConfigPath = process.env["MEMX_HOOK_CONFIG"]?.trim() || void 0;
+	for (let index = 0; index < argv.length; index += 1) {
+		const entry = argv[index];
+		if (entry === "--hook-config") {
+			const next = argv[index + 1]?.trim();
+			if (next) hookConfigPath = next;
+			index += 1;
+			continue;
+		}
+		positional.push(entry);
+	}
+	return {
+		host: positional[0] || process.env["MEMX_HOOK_HOST"] || "generic",
+		eventName: positional[1] || process.env["MEMX_HOOK_EVENT"] || "observe",
+		hookConfigPath
+	};
+}
+function stringSetting(value) {
+	return typeof value === "string" && value.trim() ? value.trim() : void 0;
+}
+function positiveNumberSetting(value) {
+	const parsed = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+	return Number.isFinite(parsed) && parsed > 0 ? parsed : void 0;
+}
+async function readHookRuntimeConfig(path) {
+	if (!path) return {};
+	try {
+		const parsed = JSON.parse(await readFile(path, "utf8"));
+		if (!isRecord(parsed)) return {};
+		return {
+			memxUrl: stringSetting(parsed.memxUrl),
+			memxSecret: stringSetting(parsed.memxSecret),
+			pendingDir: stringSetting(parsed.pendingDir),
+			hookTimeoutMs: positiveNumberSetting(parsed.hookTimeoutMs),
+			hookContextTimeoutMs: positiveNumberSetting(parsed.hookContextTimeoutMs),
+			hookObserveTimeoutMs: positiveNumberSetting(parsed.hookObserveTimeoutMs)
+		};
+	} catch (error) {
+		debug(`memx hook config ignored: ${error instanceof Error ? error.message : String(error)}`);
+		return {};
+	}
+}
 async function readStdinJson() {
 	let input = "";
 	for await (const chunk of process.stdin) input += chunk;
 	if (!input.trim()) return {};
 	return JSON.parse(input);
 }
-function authHeaders() {
-	const secret = process.env["MEMX_SECRET"];
+function authHeaders(config) {
+	const secret = process.env["MEMX_SECRET"] || config.memxSecret;
 	return secret ? { authorization: `Bearer ${secret}` } : {};
 }
-async function post(path, body, timeoutMs) {
-	const url = (process.env["MEMX_URL"] || DEFAULT_URL).replace(/\/+$/u, "");
+async function post(path, body, timeoutMs, config) {
+	const url = (process.env["MEMX_URL"] || config.memxUrl || DEFAULT_URL).replace(/\/+$/u, "");
 	const response = await fetch(`${url}${path}`, {
 		method: "POST",
 		headers: {
 			"content-type": "application/json",
-			...authHeaders()
+			...authHeaders(config)
 		},
 		body: JSON.stringify(body),
 		signal: AbortSignal.timeout(timeoutMs)
@@ -77,8 +121,12 @@ function parsePositiveInt(value, fallback) {
 	const parsed = Number(value);
 	return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
-function pendingRoot() {
-	return process.env["MEMX_PENDING_DIR"]?.trim() || join(homedir(), ".memx", "pending-hooks");
+function runtimePositiveInt(envValue, configValue, fallback) {
+	const parsed = parsePositiveInt(envValue, NaN);
+	return Number.isFinite(parsed) && parsed > 0 ? parsed : configValue ?? fallback;
+}
+function pendingRoot(config) {
+	return process.env["MEMX_PENDING_DIR"]?.trim() || config.pendingDir || join(homedir(), ".memx", "pending-hooks");
 }
 function pendingKey(envelope) {
 	return createHash("sha256").update(JSON.stringify([
@@ -88,28 +136,28 @@ function pendingKey(envelope) {
 		envelope.workspaceDir ?? ""
 	])).digest("hex");
 }
-function pendingPath(envelope) {
-	return join(pendingRoot(), `${pendingKey(envelope)}.json`);
+function pendingPath(envelope, config) {
+	return join(pendingRoot(config), `${pendingKey(envelope)}.json`);
 }
-async function writePendingTurn(envelope) {
+async function writePendingTurn(envelope, config) {
 	if (envelope.messages.length === 0) return;
-	const path = pendingPath(envelope);
-	await mkdir(pendingRoot(), { recursive: true });
+	const path = pendingPath(envelope, config);
+	await mkdir(pendingRoot(config), { recursive: true });
 	const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
 	await writeFile(tmp, `${JSON.stringify(envelope)}\n`, "utf8");
 	await rename(tmp, path);
 }
-async function readPendingTurn(envelope) {
+async function readPendingTurn(envelope, config) {
 	try {
-		const parsed = JSON.parse(await readFile(pendingPath(envelope), "utf8"));
+		const parsed = JSON.parse(await readFile(pendingPath(envelope, config), "utf8"));
 		if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.messages)) return null;
 		return parsed;
 	} catch {
 		return null;
 	}
 }
-async function clearPendingTurn(envelope) {
-	await rm(pendingPath(envelope), { force: true });
+async function clearPendingTurn(envelope, config) {
+	await rm(pendingPath(envelope, config), { force: true });
 }
 function mergePendingTurn(current, pending) {
 	const pendingMessages = pending?.messages ?? [];
@@ -133,19 +181,19 @@ function debug(message) {
 	if (process.env["MEMX_HOOK_DEBUG"] === "1") console.error(message);
 }
 async function runMemxHook(argv = process.argv.slice(2)) {
-	const host = argv[0] || process.env["MEMX_HOOK_HOST"] || "generic";
-	const eventName = argv[1] || process.env["MEMX_HOOK_EVENT"] || "observe";
+	const { host, eventName, hookConfigPath } = parseHookArgs(argv);
+	const runtimeConfig = await readHookRuntimeConfig(hookConfigPath);
 	const payload = await readStdinJson();
-	const timeoutMs = parsePositiveInt(process.env["MEMX_HOOK_TIMEOUT_MS"], MEMX_NATIVE_HOOK_TIMEOUT_MS);
-	const contextTimeoutMs = parsePositiveInt(process.env["MEMX_HOOK_CONTEXT_TIMEOUT_MS"], deriveNativeHookHttpTimeoutMs(timeoutMs));
-	const observeTimeoutMs = parsePositiveInt(process.env["MEMX_HOOK_OBSERVE_TIMEOUT_MS"], deriveNativeHookHttpTimeoutMs(timeoutMs));
+	const timeoutMs = runtimePositiveInt(process.env["MEMX_HOOK_TIMEOUT_MS"], runtimeConfig.hookTimeoutMs, MEMX_NATIVE_HOOK_TIMEOUT_MS);
+	const contextTimeoutMs = runtimePositiveInt(process.env["MEMX_HOOK_CONTEXT_TIMEOUT_MS"], runtimeConfig.hookContextTimeoutMs, deriveNativeHookHttpTimeoutMs(timeoutMs));
+	const observeTimeoutMs = runtimePositiveInt(process.env["MEMX_HOOK_OBSERVE_TIMEOUT_MS"], runtimeConfig.hookObserveTimeoutMs, deriveNativeHookHttpTimeoutMs(timeoutMs));
 	const queryCompilerTimeoutMs = deriveNativeHookQueryCompilerTimeoutMs(contextTimeoutMs);
 	try {
 		const envelope = normalizeHookPayload(host, eventName, payload);
-		if (hookShouldStorePending(eventName)) await writePendingTurn(envelope);
+		if (hookShouldStorePending(eventName)) await writePendingTurn(envelope, runtimeConfig);
 		const contextRequest = hookCanInjectContext(envelope.hostId, eventName) ? contextRequestFromEnvelope(envelope, queryCompilerTimeoutMs) : null;
 		if (contextRequest) {
-			const contextResult = await Promise.resolve().then(() => post("/v1/context", contextRequest, contextTimeoutMs)).then((value) => ({
+			const contextResult = await Promise.resolve().then(() => post("/v1/context", contextRequest, contextTimeoutMs, runtimeConfig)).then((value) => ({
 				status: "fulfilled",
 				value
 			}), (reason) => ({
@@ -159,7 +207,7 @@ async function runMemxHook(argv = process.argv.slice(2)) {
 		}
 		if (hookShouldStorePending(eventName)) return;
 		const shouldFlushPending = hookShouldFlushPending(eventName);
-		const pending = shouldFlushPending ? await readPendingTurn(envelope) : null;
+		const pending = shouldFlushPending ? await readPendingTurn(envelope, runtimeConfig) : null;
 		if (eventName === "SessionEnd" && !pending) {
 			debug("memx hook observe skipped: SessionEnd has no pending user turn");
 			return;
@@ -171,11 +219,11 @@ async function runMemxHook(argv = process.argv.slice(2)) {
 			return;
 		}
 		if (observeEnvelope.messages.length === 0) return;
-		const observeResult = await Promise.resolve().then(() => post("/v1/observe", observeEnvelope, observeTimeoutMs)).then(() => ({ status: "fulfilled" }), (reason) => ({
+		const observeResult = await Promise.resolve().then(() => post("/v1/observe", observeEnvelope, observeTimeoutMs, runtimeConfig)).then(() => ({ status: "fulfilled" }), (reason) => ({
 			status: "rejected",
 			reason
 		}));
-		if (observeResult.status === "fulfilled" && shouldFlushPending) await clearPendingTurn(envelope);
+		if (observeResult.status === "fulfilled" && shouldFlushPending) await clearPendingTurn(envelope, runtimeConfig);
 		if (observeResult.status === "rejected") debug(`memx hook observe failed: ${observeResult.reason instanceof Error ? observeResult.reason.message : String(observeResult.reason)}`);
 	} catch (error) {
 		debug(`memx hook failed: ${error instanceof Error ? error.message : String(error)}`);

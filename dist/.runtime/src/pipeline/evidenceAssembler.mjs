@@ -1038,7 +1038,7 @@ function contextCandidatesForGroup(params) {
 	}).slice(0, 3);
 }
 function packetFromGroup(params) {
-	const selected = params.entries.map((entry) => {
+	const candidates = params.entries.map((entry) => {
 		const contextCandidates = contextCandidatesForGroup({
 			queryAnalysis: params.queryAnalysis,
 			entries: params.entries,
@@ -1055,15 +1055,47 @@ function packetFromGroup(params) {
 				now: params.now
 			})
 		};
-	}).sort((left, right) => {
+	});
+	const directFactAnswerMode = operationType(params.queryAnalysis) === "return_value" || params.queryAnalysis.answerMode === "single_fact" || params.queryAnalysis.answerMode === "attribute_lookup";
+	const canonicalAnswerRank = (candidate) => {
+		if (!directFactAnswerMode) return 0;
+		if (candidate.entry.surface === "fact" && sourceRefsForEntry(candidate.entry).length > 0 && missingRequiredAfterContext(candidate.entry, candidate.contextCandidates).length === 0 && candidate.graded.blockers.length === 0) return 6;
+		if (!candidate.graded.eligibility.eligible) return 0;
+		const role = inferredSlotRole(params.queryAnalysis, candidate.entry);
+		if (!(role === "answer_value" || role === "answer_event" || candidate.graded.eligibility.role === "answer" || candidate.graded.grade.answerScore >= .42) || candidate.graded.grade.slotCoverageScore < .45) return 0;
+		if (candidate.entry.surface === "fact") return 3;
+		if (candidate.entry.surface === "event") return 2;
+		if (candidate.entry.surface === "chunk" || candidate.entry.surface === "snippet") return 1;
+		return 0;
+	};
+	const canonicalAdjustedScore = (candidate) => candidate.graded.grade.finalScore + canonicalAnswerRank(candidate) * .12;
+	const rankedSelected = candidates.sort((left, right) => {
 		if (left.graded.eligibility.eligible !== right.graded.eligibility.eligible) return left.graded.eligibility.eligible ? -1 : 1;
+		const leftAdjusted = canonicalAdjustedScore(left);
+		const rightAdjusted = canonicalAdjustedScore(right);
+		if (leftAdjusted !== rightAdjusted) return rightAdjusted - leftAdjusted;
 		return right.graded.grade.finalScore - left.graded.grade.finalScore;
 	})[0];
-	if (!selected) return null;
+	if (!rankedSelected) return null;
+	const rankedSourceRefs = sourceRefsForEntry(rankedSelected.entry);
+	const canonicalSubstituteEntry = directFactAnswerMode && rankedSelected.entry.surface !== "fact" ? params.allEntries.find((entry) => entry.surface === "fact" && !entry.dropReason && sourceRefsForEntry(entry).some((sourceRef) => rankedSourceRefs.includes(sourceRef))) : void 0;
+	const selected = canonicalSubstituteEntry && entryKey(canonicalSubstituteEntry) !== entryKey(rankedSelected.entry) ? {
+		entry: canonicalSubstituteEntry,
+		contextCandidates: [...new Map([rankedSelected.entry, ...rankedSelected.contextCandidates].filter((entry) => entryKey(entry) !== entryKey(canonicalSubstituteEntry)).map((entry) => [entryKey(entry), entry])).values()],
+		graded: gradeCandidate({
+			queryAnalysis: params.queryAnalysis,
+			entry: canonicalSubstituteEntry,
+			contextCandidates: [...new Map([rankedSelected.entry, ...rankedSelected.contextCandidates].filter((entry) => entryKey(entry) !== entryKey(canonicalSubstituteEntry)).map((entry) => [entryKey(entry), entry])).values()],
+			now: params.now
+		})
+	} : rankedSelected;
+	const directFactContextSatisfied = directFactAnswerMode && selected.entry.surface === "fact" && selected.graded.blockers.length === 0 && missingRequiredAfterContext(selected.entry, selected.contextCandidates).length === 0;
+	const selectedContextCandidates = directFactContextSatisfied ? [] : selected.contextCandidates;
+	const coverageContextCandidates = directFactContextSatisfied ? selected.contextCandidates : selectedContextCandidates;
 	const unitGroups = classifyPacketUnits({
 		queryAnalysis: params.queryAnalysis,
 		selectedEntry: selected.entry,
-		contextCandidates: selected.contextCandidates
+		contextCandidates: selectedContextCandidates
 	});
 	const { displayLines, hiddenExactDuplicates } = packetDisplayLines({
 		queryAnalysis: params.queryAnalysis,
@@ -1075,7 +1107,8 @@ function packetFromGroup(params) {
 	const displayOnlyContext = returnValueMode && (!hasAnswerDisplayLine || unitGroups.answerUnits.length === 0);
 	const packetDirectCauseScore = querySeeksCausalAnswer(params.queryAnalysis) ? Math.max(evidenceShapeFitScore(params.queryAnalysis, selected.entry, ["causal_explanation"]), evidenceShapeFitScoreForTexts(params.queryAnalysis, [...displayLines, ...unitGroups.answerUnits.map((unit) => `${unit.displayText} ${unit.rawText}`)], ["causal_explanation"])) : 0;
 	const packetSuppliesDirectCause = packetDirectCauseScore >= .72 && directCausalExplanationScore(params.queryAnalysis, selected.entry) < .5;
-	const baseSoftPenalties = packetSuppliesDirectCause ? selected.graded.softPenalties.filter((reason) => reason !== "weak-causal-explanation" && reason !== "query-like-answer-candidate") : selected.graded.softPenalties;
+	const directFactHiddenSupportPenalties = directFactContextSatisfied ? selected.graded.softPenalties.filter((reason) => reason !== "answer-without-bound-context" && reason !== "weak-query-context-binding" && !reason.startsWith("missing-context:")) : selected.graded.softPenalties;
+	const baseSoftPenalties = packetSuppliesDirectCause ? directFactHiddenSupportPenalties.filter((reason) => reason !== "weak-causal-explanation" && reason !== "query-like-answer-candidate") : directFactHiddenSupportPenalties;
 	const adjustedSoftPenalties = displayOnlyContext ? [...selected.graded.softPenalties, "no-answer-display-line"] : baseSoftPenalties;
 	const packetCausalGrade = packetSuppliesDirectCause ? {
 		...selected.graded.grade,
@@ -1083,11 +1116,19 @@ function packetFromGroup(params) {
 		softPenaltyScore: Math.max(0, (selected.graded.grade.softPenaltyScore ?? 0) - .42),
 		finalScore: Math.max(selected.graded.grade.finalScore, clamp01(.46 + (selected.graded.grade.contextBindingScore ?? 0) * .1 + selected.graded.grade.authorityScore * .05 + selected.graded.grade.retrievalScore * .06))
 	} : selected.graded.grade;
-	const adjustedGrade = displayOnlyContext ? {
+	const contextSupportedFactGrade = directFactContextSatisfied ? {
 		...packetCausalGrade,
-		softPenaltyScore: clamp01((packetCausalGrade.softPenaltyScore ?? 0) + .42),
-		finalScore: clamp01(packetCausalGrade.finalScore - .42)
+		answerScore: Math.max(packetCausalGrade.answerScore, .46),
+		contextBindingScore: Math.max(packetCausalGrade.contextBindingScore, .72),
+		slotCoverageScore: Math.max(packetCausalGrade.slotCoverageScore, .58),
+		softPenaltyScore: Math.max(0, (packetCausalGrade.softPenaltyScore ?? 0) - .24),
+		finalScore: Math.max(packetCausalGrade.finalScore, .72)
 	} : packetCausalGrade;
+	const adjustedGrade = displayOnlyContext ? {
+		...contextSupportedFactGrade,
+		softPenaltyScore: clamp01((contextSupportedFactGrade.softPenaltyScore ?? 0) + .42),
+		finalScore: clamp01(contextSupportedFactGrade.finalScore - .42)
+	} : contextSupportedFactGrade;
 	const adjustedEligibility = displayOnlyContext ? {
 		...selected.graded.eligibility,
 		role: "support"
@@ -1100,19 +1141,19 @@ function packetFromGroup(params) {
 	const allSourceRefs = [...new Set(allUnits.flatMap((unit) => refsForUnit(unit)))];
 	const sourceRefs = [...new Set([
 		...sourceRefsForEntry(selected.entry),
-		...selected.contextCandidates.flatMap((entry) => sourceRefsForEntry(entry)),
+		...coverageContextCandidates.flatMap((entry) => sourceRefsForEntry(entry)),
 		...allSourceRefs
 	])];
 	const supportSourceRefs = [...new Set([
-		...selected.contextCandidates.flatMap((entry) => sourceRefsForEntry(entry)),
+		...coverageContextCandidates.flatMap((entry) => sourceRefsForEntry(entry)),
 		...allUnits.flatMap((unit) => unit.supportRefs ?? []),
 		...unitGroups.contextUnits.flatMap((unit) => refsForUnit(unit)),
 		...unitGroups.supportUnits.flatMap((unit) => refsForUnit(unit))
 	])];
-	const slotIds = [...new Set([selected.entry, ...selected.contextCandidates].flatMap((entry) => matchedSlotIds(entry)))];
+	const slotIds = [...new Set([selected.entry, ...coverageContextCandidates].flatMap((entry) => matchedSlotIds(entry)))];
 	const slotId = slotIds[0] ?? "unplanned";
 	const slotById = new Map((params.queryAnalysis.evidencePlan?.slots ?? []).map((slot) => [slot.id, slot]));
-	const missing = [...new Set([...missingRequiredAfterContext(selected.entry, selected.contextCandidates), ...slotIds.map((slotId) => slotById.get(slotId)).filter((slot) => Boolean(slot)).filter((slot) => slotNeedsTemporalField(params.queryAnalysis, slot)).filter(() => !selected.entry.observedAt && !selected.contextCandidates.some((candidate) => candidate.observedAt)).map(() => "observedAt")].filter(Boolean))];
+	const missing = [...new Set([...missingRequiredAfterContext(selected.entry, coverageContextCandidates), ...slotIds.map((slotId) => slotById.get(slotId)).filter((slot) => Boolean(slot)).filter((slot) => slotNeedsTemporalField(params.queryAnalysis, slot)).filter(() => !selected.entry.observedAt && !coverageContextCandidates.some((candidate) => candidate.observedAt)).map(() => "observedAt")].filter(Boolean))];
 	const role = adjustedEligibility.role === "answer" || adjustedEligibility.role === "resource" || !displayOnlyContext && adjustedGrade.answerScore >= .28 ? "partial" : "support";
 	return {
 		packetId: `packet:${stableHash([
@@ -1127,13 +1168,13 @@ function packetFromGroup(params) {
 		role,
 		protected: false,
 		answerCandidate: selected.entry,
-		contextCandidates: selected.contextCandidates,
+		contextCandidates: selectedContextCandidates,
 		answerUnits: unitGroups.answerUnits,
 		contextUnits: unitGroups.contextUnits,
 		supportUnits: unitGroups.supportUnits,
 		layers: [...new Set([selected.entry.surface])],
 		primaryText: displayLines[0] ?? truncateText(selected.entry.text, 560),
-		supportingTexts: displayLines.length > 1 ? displayLines.slice(1) : selected.contextCandidates.map((entry) => truncateText(entry.text, 260)).filter((text) => semanticTextSimilarity(text, selected.entry.text) < .82),
+		supportingTexts: displayLines.length > 1 ? displayLines.slice(1) : selectedContextCandidates.map((entry) => truncateText(entry.text, 260)).filter((text) => semanticTextSimilarity(text, selected.entry.text) < .82),
 		sourceRefs,
 		supportSourceRefs,
 		allSourceRefs,
@@ -1159,8 +1200,8 @@ function packetFromGroup(params) {
 		},
 		displayLines,
 		hiddenExactDuplicates,
-		observedAt: selected.entry.observedAt ?? selected.contextCandidates.find((entry) => entry.observedAt)?.observedAt,
-		resolvedDate: selected.entry.observedAt?.slice(0, 10) ?? selected.contextCandidates.find((entry) => entry.observedAt)?.observedAt?.slice(0, 10),
+		observedAt: selected.entry.observedAt ?? selectedContextCandidates.find((entry) => entry.observedAt)?.observedAt,
+		resolvedDate: selected.entry.observedAt?.slice(0, 10) ?? selectedContextCandidates.find((entry) => entry.observedAt)?.observedAt?.slice(0, 10),
 		dedupeKey: sourceKey(sourceRefs, selected.entry.text),
 		authorRoles: [...new Set(allUnits.map((unit) => unit.authorRole).filter(Boolean))].filter((role) => Boolean(role) && role !== "unknown"),
 		coverage: {
@@ -1257,12 +1298,20 @@ function packetHasSoftPenaltyPrefix(packet, prefix) {
 function packetCoverageSatisfied(packet) {
 	return packet.coverage.filled && packet.coverage.missing.length === 0;
 }
+function packetHasBlockingPromptPenalty(queryAnalysis, packet) {
+	if (packetHasSoftPenaltyPrefix(packet, "missing-context:")) return true;
+	if (packetHasSoftPenalty(packet, "answer-without-bound-context")) return true;
+	return operationType(queryAnalysis) === "return_value" && packetHasSoftPenalty(packet, "weak-query-context-binding");
+}
+function packetPromptInjectionFloor(queryAnalysis, packet, floor) {
+	if (operationType(queryAnalysis) === "tailor_advice") return Math.max(.46, floor + .12);
+	if (queryAnalysis.answerMode === "count_aggregate" || operationType(queryAnalysis) === "aggregate") return Math.max(.5, floor + .16);
+	return packetCoverageSatisfied(packet) ? Math.max(.52, floor + .2) : Math.max(.62, floor + .12);
+}
 function packetEligibleForPromptInjection(queryAnalysis, packet, floor) {
-	if (packetCoverageSatisfied(packet)) return true;
-	if (packetHasSoftPenaltyPrefix(packet, "missing-context:")) return false;
-	if (packetHasSoftPenalty(packet, "answer-without-bound-context")) return false;
-	if (operationType(queryAnalysis) === "return_value" && packetHasSoftPenalty(packet, "weak-query-context-binding")) return false;
-	return (packet.grade?.finalScore ?? 0) >= Math.max(.62, floor + .12) && (packet.grade?.slotCoverageScore ?? 0) >= .45;
+	if (packetHasBlockingPromptPenalty(queryAnalysis, packet)) return false;
+	if (!packetHasAnswerDisplayForQuery(queryAnalysis, packet) && operationType(queryAnalysis) !== "derive" && operationType(queryAnalysis) !== "compare") return false;
+	return (packet.grade?.finalScore ?? 0) >= packetPromptInjectionFloor(queryAnalysis, packet, floor) && (packet.grade?.slotCoverageScore ?? 0) >= .45;
 }
 function packetHasAnswerDisplayForQuery(queryAnalysis, packet) {
 	const aggregateMode = queryAnalysis.answerMode === "count_aggregate" || operationType(queryAnalysis) === "aggregate";
@@ -1281,6 +1330,8 @@ function selectInjectedPackets(queryAnalysis, packets) {
 	const selectablePackets = scoredRankedForSelection.some((packet) => packetHasAnswerDisplayForQuery(queryAnalysis, packet)) ? scoredRankedForSelection.filter((packet) => packetHasAnswerDisplayForQuery(queryAnalysis, packet)) : scoredRankedForSelection;
 	const topScore = selectablePackets.length > 0 ? packetSortValue(selectablePackets[0]) : 0;
 	const effectiveAllowedGap = packetCurveGap(queryAnalysis);
+	const directCanonicalAnswer = operationType(queryAnalysis) === "return_value" || queryAnalysis.answerMode === "single_fact" || queryAnalysis.answerMode === "attribute_lookup" ? selectablePackets.find((packet) => packet.answerCandidate?.surface === "fact" && packetCoverageSatisfied(packet) && packetHasAnswerDisplayForQuery(queryAnalysis, packet)) : void 0;
+	if (directCanonicalAnswer) return new Set([directCanonicalAnswer.packetId]);
 	if (operationType(queryAnalysis) === "derive" || operationType(queryAnalysis) === "compare") {
 		const bySlot = /* @__PURE__ */ new Map();
 		for (const packet of selectablePackets) {
@@ -1318,36 +1369,6 @@ function selectInjectedPackets(queryAnalysis, packets) {
 		selected.add(packet.packetId);
 		selectedDistinct.add(distinctKey);
 		if (!aggregateMode && displayKey) selectedAnswerDisplays.add(displayKey);
-	}
-	if (selected.size === 0 && selectablePackets.length > 0) {
-		const fallbackLimit = Math.min(limit, aggregateMode ? 3 : 3);
-		const fallbackFamilies = /* @__PURE__ */ new Set();
-		for (const packet of selectablePackets) {
-			if (selected.size >= fallbackLimit) break;
-			if (!aggregateMode && packetHasSoftPenaltyPrefix(packet, "missing-context:") && [...selected].filter((packetId) => {
-				const selectedPacket = packets.find((candidate) => candidate.packetId === packetId);
-				return selectedPacket && !packetHasSoftPenaltyPrefix(selectedPacket, "missing-context:");
-			}).length >= 2) continue;
-			const sourceRef = packet.sourceRefs[0] ?? packet.allSourceRefs?.[0];
-			const familyKey = sourceRef ? sourceFamilyRef(sourceRef) : packetDistinctKey(packet);
-			if (fallbackFamilies.has(familyKey)) continue;
-			const displayKey = packetAnswerDisplayKey(packet);
-			if (!aggregateMode && displayKey && selectedAnswerDisplays.has(displayKey)) continue;
-			selected.add(packet.packetId);
-			if (!aggregateMode && displayKey) selectedAnswerDisplays.add(displayKey);
-			fallbackFamilies.add(familyKey);
-		}
-		for (const packet of selectablePackets) {
-			if (selected.size >= fallbackLimit) break;
-			if (!aggregateMode && packetHasSoftPenaltyPrefix(packet, "missing-context:") && [...selected].filter((packetId) => {
-				const selectedPacket = packets.find((candidate) => candidate.packetId === packetId);
-				return selectedPacket && !packetHasSoftPenaltyPrefix(selectedPacket, "missing-context:");
-			}).length >= 2) continue;
-			const displayKey = packetAnswerDisplayKey(packet);
-			if (!aggregateMode && displayKey && selectedAnswerDisplays.has(displayKey)) continue;
-			selected.add(packet.packetId);
-			if (!aggregateMode && displayKey) selectedAnswerDisplays.add(displayKey);
-		}
 	}
 	return selected;
 }

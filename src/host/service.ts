@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_MEMORY_CONFIG, memxConfigSchema } from "../config.js";
 import { compileQuery } from "../pipeline/queryCompiler.js";
-import { retrieveEvidence } from "../pipeline/retrieve.js";
+import { renderEvidenceBundle, retrieveEvidence } from "../pipeline/retrieve.js";
 import { captureAgentEndTurn } from "../pipeline/turnCapture.js";
 import { buildOperationContext, MemxRuntimeManager, type MemxStoreBundle } from "../runtime.js";
 import { resolveDefaultScope } from "../security/scopes.js";
@@ -35,6 +35,14 @@ export type MemxRecallRequest = {
   workspaceDir?: string;
   project?: string;
   hotPathTimeoutMs?: number;
+};
+
+export type MemxAgentRequest = {
+  hostId?: string;
+  actorId?: string;
+  sessionId?: string;
+  workspaceDir?: string;
+  project?: string;
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -240,6 +248,10 @@ function formatRecallContext(bundle: EvidenceBundle, limit: number): string {
   ].join("\n");
 }
 
+export function formatNativeRecallContext(bundle: EvidenceBundle, maxChars: number): string {
+  return renderEvidenceBundle(bundle, maxChars);
+}
+
 type NativeContextEligibility = {
   eligible: boolean;
   reason: string;
@@ -258,56 +270,33 @@ function bestInjectedPacketScore(packets: EvidencePacket[]): number {
   );
 }
 
-function bestEvidenceRowScore(rows: Array<Record<string, unknown>>): number {
-  return rows.reduce(
-    (best, row) =>
-      Math.max(
-        best,
-        typeof row.score === "number" && Number.isFinite(row.score) ? row.score : 0,
-        typeof row.confidence === "number" && Number.isFinite(row.confidence)
-          ? row.confidence
-          : 0,
-      ),
-    0,
+function packetHasNativeAnswerSurface(packet: EvidencePacket): boolean {
+  if (packet.role === "answer" || packet.eligibility?.role === "answer") {
+    return true;
+  }
+  const lines = packet.displayLines && packet.displayLines.length > 0 ? packet.displayLines : [packet.primaryText];
+  return lines.some(
+    (line) =>
+      line.startsWith("[answer]") ||
+      line.startsWith("[resource]") ||
+      (packet.operationType === "aggregate" && line.startsWith("[event]")),
   );
 }
 
-function directEvidenceEligibility(bundle: EvidenceBundle): NativeContextEligibility | null {
-  const states = Array.isArray(bundle.states) ? bundle.states : [];
-  const facts = Array.isArray(bundle.facts) ? bundle.facts : [];
-  const graphPaths = Array.isArray(bundle.graph?.paths) ? bundle.graph.paths : [];
-  const behavioralGuidance = Array.isArray(bundle.behavioralGuidance) ? bundle.behavioralGuidance : [];
-  const events = Array.isArray(bundle.events) ? bundle.events : [];
-  const promptEvidence = Array.isArray(bundle.promptEvidence) ? bundle.promptEvidence : [];
-  const routeConfidence =
-    typeof bundle.routeConfidence === "number" && Number.isFinite(bundle.routeConfidence)
-      ? bundle.routeConfidence
-      : 0;
-  const structuredRows = [...states, ...facts];
-  if (structuredRows.length > 0) {
-    return {
-      eligible: true,
-      reason: "direct-structured-evidence",
-      bestScore: Math.max(bestEvidenceRowScore(structuredRows), routeConfidence),
-    };
-  }
-  if (graphPaths.length > 0 || behavioralGuidance.length > 0) {
-    return {
-      eligible: true,
-      reason: "direct-graph-or-guidance-evidence",
-      bestScore: routeConfidence,
-    };
-  }
-  const sourceRows = [...events, ...promptEvidence];
-  const bestSourceScore = bestEvidenceRowScore(sourceRows);
-  if (sourceRows.length > 0 && (bestSourceScore >= 0.25 || routeConfidence >= 0.35)) {
-    return {
-      eligible: true,
-      reason: "direct-source-evidence",
-      bestScore: Math.max(bestSourceScore, routeConfidence),
-    };
-  }
-  return null;
+function packetIsStrongNativeContextEvidence(packet: EvidencePacket): boolean {
+  const score = packet.grade?.finalScore ?? packet.score ?? packet.coverage.confidence ?? 0;
+  const slotCoverage =
+    packet.grade?.slotCoverageScore ?? (packet.coverage.filled ? packet.coverage.confidence : 0);
+  const contextBinding =
+    packet.grade?.contextBindingScore ?? (packet.coverage.filled ? packet.coverage.confidence : 0);
+  return (
+    packetHasSourceGroundedEvidence(packet) &&
+    packetHasNativeAnswerSurface(packet) &&
+    packet.coverage.missing.length === 0 &&
+    score >= 0.62 &&
+    slotCoverage >= 0.45 &&
+    contextBinding >= 0.42
+  );
 }
 
 function appendStagedPendingEvidence(
@@ -332,9 +321,50 @@ function appendStagedPendingEvidence(
       sourceRef: `pending-staged:${turn.turnId}`,
     },
   }));
+  const stagedPackets: EvidencePacket[] = stagedRows.map((row) => ({
+    packetId: row.id,
+    slotId: "pending-staged-turn",
+    operationType: "return_value",
+    role: "answer",
+    protected: true,
+    injected: true,
+    layers: ["chunk"],
+    primaryText: row.text,
+    supportingTexts: [],
+    sourceRefs: [row.sourceRef],
+    allSourceRefs: [row.sourceRef],
+    score: row.score,
+    scoreBreakdown: {
+      stagedPendingTurn: true,
+      retrievalScore: row.score,
+    },
+    displayLines: [`[answer] ${truncateText(row.text, 360)}`],
+    observedAt: row.observedAt,
+    authorRoles: ["user", "assistant"],
+    coverage: {
+      filled: true,
+      missing: [],
+      confidence: row.confidence,
+    },
+    eligibility: {
+      eligible: true,
+      role: "answer",
+      blockers: [],
+    },
+    grade: {
+      retrievalScore: row.score,
+      answerScore: row.score,
+      contextBindingScore: row.score,
+      slotCoverageScore: row.score,
+      authorityScore: 0.72,
+      finalScore: row.score,
+    },
+    selectionReason: "pending staged turn evidence while semantic write is still queued",
+  }));
   return {
     ...bundle,
     events: [...stagedRows, ...bundle.events],
+    evidencePackets: [...stagedPackets, ...bundle.evidencePackets],
     recalledChunkTexts: [...stagedRows.map((row) => row.text), ...bundle.recalledChunkTexts],
     diagnostics: [...bundle.diagnostics, "pending-staged-turn-evidence"],
   };
@@ -481,7 +511,7 @@ export function assessNativeContextEligibility(
 ): NativeContextEligibility {
   const packets = injectedPackets(bundle);
   if (packets.length === 0) {
-    return directEvidenceEligibility(bundle) ?? {
+    return {
       eligible: false,
       reason: "no-injected-packets",
       bestScore: 0,
@@ -491,38 +521,12 @@ export function assessNativeContextEligibility(
   if (packets.some((packet) => packetMentionsSuppressedEntity(packet, queryAnalysis))) {
     return { eligible: false, reason: "suppressed-entity-anchor", bestScore };
   }
-  const enoughEvidence =
-    bestScore >= 0.62 ||
-    bundle.routeConfidence >= 0.68 ||
-    packets.some((packet) => packet.coverage.filled && packet.coverage.confidence >= 0.58);
+  const enoughEvidence = packets.some(packetIsStrongNativeContextEvidence);
   if (enoughEvidence) {
     return {
       eligible: true,
       reason: queryAnalysis.queryEntities.length > 0 ? "llm-query-entities" : "strong-evidence",
       bestScore,
-    };
-  }
-  if (
-    queryAnalysis.queryEntities.length > 0 &&
-    packets.some((packet) => packet.coverage.filled || (packet.coverage.confidence ?? 0) >= 0.35)
-  ) {
-    return { eligible: true, reason: "entity-supported-evidence", bestScore };
-  }
-  if (
-    packets.some(
-      (packet) =>
-        packetHasSourceGroundedEvidence(packet) &&
-        (packet.grade?.finalScore ?? packet.score ?? 0) >= 0.32 &&
-        packet.coverage.confidence >= 0.35,
-    )
-  ) {
-    return { eligible: true, reason: "assembled-source-evidence", bestScore };
-  }
-  const directEligibility = directEvidenceEligibility(bundle);
-  if (directEligibility) {
-    return {
-      ...directEligibility,
-      bestScore: Math.max(directEligibility.bestScore, bestScore),
     };
   }
   return { eligible: false, reason: "weak-evidence", bestScore };
@@ -695,12 +699,13 @@ export class MemxHostService {
     const contextEligibility = assessNativeContextEligibility(request.query, compiled, focusedBundle);
     const graphPaths = Array.isArray(focusedBundle.graph?.paths) ? focusedBundle.graph.paths : [];
     const graphEdges = Array.isArray(focusedBundle.graph?.edges) ? focusedBundle.graph.edges : [];
+    const nativeContext = formatNativeRecallContext(focusedBundle, this.config.maxInjectedChars);
     return {
       ok: true,
       routeType: focusedBundle.routeType,
       routeConfidence: focusedBundle.routeConfidence,
       focusedQuery: compiled.focusedQuery,
-      context: formatRecallContext(focusedBundle, limit),
+      context: nativeContext,
       contextEligibility,
       states: focusedBundle.states.slice(0, limit),
       facts: focusedBundle.facts.slice(0, limit),
@@ -759,11 +764,13 @@ export class MemxHostService {
     return { ok: true, deleted, kind, id };
   }
 
-  async stats(): Promise<Record<string, unknown>> {
+  async stats(request: MemxAgentRequest = {}): Promise<Record<string, unknown>> {
     const ctx = asEnvelopeContext(this.config, {
-      hostId: "generic",
-      actorId: process.env["MEMX_ACTOR_ID"] || "memx-shared",
-      sessionId: "stats",
+      hostId: request.hostId === "codex" || request.hostId === "claude-code" ? request.hostId : "generic",
+      actorId: request.actorId || process.env["MEMX_ACTOR_ID"] || "memx-shared",
+      sessionId: request.sessionId || "stats",
+      workspaceDir: request.workspaceDir,
+      project: request.project,
     });
     const store = await this.manager.getStore(ctx);
     return {
@@ -781,18 +788,36 @@ export class MemxHostService {
     };
   }
 
-  async audit(limit = 50): Promise<Record<string, unknown>> {
+  async audit(limit = 50, request: MemxAgentRequest = {}): Promise<Record<string, unknown>> {
     const ctx = asEnvelopeContext(this.config, {
-      hostId: "generic",
-      actorId: process.env["MEMX_ACTOR_ID"] || "memx-shared",
-      sessionId: "audit",
+      hostId: request.hostId === "codex" || request.hostId === "claude-code" ? request.hostId : "generic",
+      actorId: request.actorId || process.env["MEMX_ACTOR_ID"] || "memx-shared",
+      sessionId: request.sessionId || "audit",
+      workspaceDir: request.workspaceDir,
+      project: request.project,
     });
     const store = await this.manager.getStore(ctx);
+    const boundedLimit = Math.max(1, Math.min(Math.trunc(limit), 200));
     return {
       ok: true,
+      agentId: ctx.agentId,
+      dbPath: ctx.dbPath,
+      scopes: ctx.scopes,
       signals: store.auditRepo.listSignals({
         agentId: ctx.agentId,
-        limit: Math.max(1, Math.min(Math.trunc(limit), 200)),
+        limit: boundedLimit,
+      }),
+      retrievals: store.auditRepo.listRetrievals({
+        agentId: ctx.agentId,
+        limit: boundedLimit,
+      }),
+      policyDecisions: store.auditRepo.listPolicyDecisions({
+        agentId: ctx.agentId,
+        limit: boundedLimit,
+      }),
+      maintenanceRuns: store.auditRepo.listMaintenanceRuns({
+        agentId: ctx.agentId,
+        limit: boundedLimit,
       }),
     };
   }

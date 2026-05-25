@@ -34,6 +34,70 @@ function shouldSuppressMessageFromSemanticMemory(ctx, message) {
 	const secretLike = containsLikelySecret(content);
 	return looksLikePromptInjection(content) && !secretLike || secretLike || containsSensitiveValue(content) || sensitivityScore(content) > ctx.config.maxSensitivityAllowed;
 }
+function semanticDraftHasWriteSignals(hints) {
+	const draft = hints?.semanticDraft;
+	return Boolean((draft?.assertionDrafts.length ?? 0) > 0 || (draft?.correctionDrafts.length ?? 0) > 0 || (draft?.relationDrafts?.length ?? 0) > 0 || (draft?.resourceAssertions?.length ?? 0) > 0 || (draft?.adviceSignals?.length ?? 0) > 0 || (hints?.resourceAssertions?.length ?? 0) > 0 || (hints?.adviceSignals?.length ?? 0) > 0);
+}
+function semanticOnlyCandidateText(hints) {
+	if (!semanticDraftHasWriteSignals(hints)) return;
+	const draft = hints?.semanticDraft;
+	const lines = [];
+	for (const assertion of draft?.assertionDrafts ?? []) {
+		const entities = (assertion.entityHints ?? []).map((entry) => entry.name).filter(Boolean);
+		const slots = assertion.slotHints?.filter(Boolean) ?? [];
+		const value = assertion.valueHint?.trim();
+		const support = assertion.supportSpans?.find((span) => span.text.trim())?.text.trim();
+		lines.push([
+			assertion.familyHint,
+			assertion.timeframeHint,
+			entities.join(" / "),
+			slots.join(" / "),
+			value,
+			support
+		].filter(Boolean).join(" | "));
+	}
+	for (const correction of draft?.correctionDrafts ?? []) {
+		const entry = correction.correction;
+		lines.push([
+			"correction",
+			entry.targetKind,
+			entry.canonicalKey,
+			entry.predicate,
+			entry.priorValue ? `from ${entry.priorValue}` : void 0,
+			entry.nextValue ? `to ${entry.nextValue}` : void 0,
+			entry.reason
+		].filter(Boolean).join(" | "));
+	}
+	for (const relation of draft?.relationDrafts ?? []) {
+		const entry = relation.relation;
+		if (entry.polarity === "negated") continue;
+		lines.push([
+			"relation",
+			entry.subject,
+			entry.predicate,
+			entry.relationSlot,
+			entry.object,
+			entry.reason
+		].filter(Boolean).join(" | "));
+	}
+	for (const resource of [...draft?.resourceAssertions ?? [], ...hints?.resourceAssertions ?? []]) lines.push([
+		"resource",
+		resource.owner,
+		resource.ownershipStatus,
+		resource.resource,
+		resource.resourceType,
+		resource.supportText
+	].filter(Boolean).join(" | "));
+	for (const advice of [...draft?.adviceSignals ?? [], ...hints?.adviceSignals ?? []]) lines.push([
+		"advice",
+		advice.problemContext,
+		advice.userResources?.join(" / "),
+		advice.assistantRecommendation,
+		advice.supportText
+	].filter(Boolean).join(" | "));
+	const text = lines.filter((line) => line.trim()).join("\n").trim();
+	return text ? truncateText(text, 1200) : void 0;
+}
 function mapEvidenceChunkIds(chunks, indexes) {
 	const unique = /* @__PURE__ */ new Set();
 	for (const index of indexes) {
@@ -187,13 +251,21 @@ function taskSupportRefs(chunks) {
 	if (!chunks || chunks.length === 0) return [];
 	return [...new Set(chunks.map((chunk) => chunk.sourceRef).filter((sourceRef) => Boolean(sourceRef?.trim())))];
 }
+function taskVectorDocId(task) {
+	return `state:task:${task.taskId}`;
+}
+function recallableTaskTitle(title) {
+	const trimmed = title.trim();
+	if (!trimmed) return;
+	return normalizeText(trimmed) === "active task" ? void 0 : trimmed;
+}
 function buildTaskVectorDoc(task, chunks) {
 	const metadata = sanitizeTaskMetadata(task.metadataJson);
 	const rawMetadata = objectRecord(task.metadataJson);
 	const semanticSummary = semanticTaskSummaryText(task);
 	const supportRefs = taskSupportRefs(chunks);
 	const taskText = [
-		task.title,
+		recallableTaskTitle(task.title),
 		typeof rawMetadata?.candidateResolution === "string" && rawMetadata.candidateResolution.trim() ? rawMetadata.candidateResolution.trim() : void 0,
 		metadata.currentTask,
 		metadata.project,
@@ -201,8 +273,9 @@ function buildTaskVectorDoc(task, chunks) {
 		metadata.blocker,
 		semanticSummary
 	].filter((value) => Boolean(value)).join("\n").trim();
+	if (!taskText) return null;
 	return {
-		docId: `state:task:${task.taskId}`,
+		docId: taskVectorDocId(task),
 		docKind: "state",
 		sourceId: `task:${task.taskId}`,
 		scope: task.scope,
@@ -229,6 +302,14 @@ function buildTaskVectorDoc(task, chunks) {
 		createdAt: task.startedAt,
 		updatedAt: task.updatedAt
 	};
+}
+function upsertTaskVectorDoc(store, task, chunks) {
+	const doc = buildTaskVectorDoc(task, chunks);
+	if (!doc) {
+		store.retrievalBackend.deleteDocs([taskVectorDocId(task)]);
+		return;
+	}
+	store.retrievalBackend.upsertDocs([doc]);
 }
 function resolveCurrentProjectContext(params) {
 	const metadataProject = sanitizeTaskMetadata(params.activeTask.metadataJson).project;
@@ -414,7 +495,7 @@ var MemxTurnScheduler = class {
 			updatedAt: observedAt
 		};
 		this.store.taskRepo.update(task.taskId, closedTask);
-		this.store.retrievalBackend.upsertDocs([buildTaskVectorDoc(closedTask, closedChunks)]);
+		upsertTaskVectorDoc(this.store, closedTask, closedChunks);
 		return closedTask;
 	}
 	reopenTask(task, observedAt) {
@@ -425,7 +506,7 @@ var MemxTurnScheduler = class {
 			updatedAt: observedAt
 		};
 		this.store.taskRepo.update(task.taskId, reopenedTask);
-		this.store.retrievalBackend.upsertDocs([buildTaskVectorDoc(reopenedTask, this.store.chunkRepo.listByTask(reopenedTask.taskId))]);
+		upsertTaskVectorDoc(this.store, reopenedTask, this.store.chunkRepo.listByTask(reopenedTask.taskId));
 		return reopenedTask;
 	}
 	async persistRecallableChunks(ctx, activeTask, messages) {
@@ -649,9 +730,11 @@ var MemxTurnScheduler = class {
 			message
 		});
 		const sourceRef = message.sourceRef || `${message.role}:${message.turnId}`;
+		const compilerHints = frameHintsForSourceRef(turnSemanticFrame, sourceRef);
+		const assistantSemanticText = message.role === "assistant" ? semanticOnlyCandidateText(compilerHints) : void 0;
 		const candidate = buildCandidate({
 			sourceKind: message.role === "tool" ? "tool" : message.role === "assistant" ? "assistant" : "user",
-			rawText: message.content,
+			rawText: message.role === "assistant" ? assistantSemanticText ?? "" : message.content,
 			observedAt: message.observedAt,
 			config: ctx.config,
 			source: {
@@ -665,6 +748,7 @@ var MemxTurnScheduler = class {
 				taskId: activeTask.taskId,
 				chunkSummary: chunk.summary,
 				sourceRef,
+				...message.role === "assistant" ? { assistantSemanticOnly: Boolean(assistantSemanticText) } : {},
 				sourceGroupId: sourceSegments[0]?.sourceGroupId,
 				segmentRefs: sourceSegments.map((segment) => segment.segmentId),
 				segmentCount: sourceSegments.length,
@@ -673,8 +757,8 @@ var MemxTurnScheduler = class {
 				...projectContext
 			}
 		});
-		if (!candidate || message.role === "assistant") return;
-		const compilerHints = frameHintsForSourceRef(turnSemanticFrame, sourceRef);
+		if (!candidate) return;
+		if (message.role === "assistant" && !assistantSemanticText) return;
 		const policyResult = await evaluatePolicy(compilerHints ? {
 			...candidate,
 			structuredHints: {
@@ -759,7 +843,7 @@ var MemxTurnScheduler = class {
 			updatedAt: messages.at(-1)?.observedAt ?? ctx.now
 		};
 		this.store.taskRepo.update(activeTask.taskId, updatedTask);
-		this.store.retrievalBackend.upsertDocs([buildTaskVectorDoc(updatedTask, taskChunks)]);
+		upsertTaskVectorDoc(this.store, updatedTask, taskChunks);
 	}
 };
 //#endregion

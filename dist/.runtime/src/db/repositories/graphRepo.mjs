@@ -145,7 +145,13 @@ var GraphRepo = class {
 		return this.db.prepare(`SELECT entity_id, canonical_name, entity_type, normalized_name, aliases_json, confidence, created_at, updated_at
            FROM entities
           ORDER BY confidence DESC, updated_at DESC
-          LIMIT 128`).all().filter((row) => normalizedQuery.includes(row.normalized_name)).slice(0, limit).map((row) => this.toEntity(row));
+          LIMIT 128`).all().filter((row) => {
+			if (normalizedQuery.includes(row.normalized_name) || row.normalized_name.includes(normalizedQuery)) return true;
+			return safeJsonParse(row.aliases_json, []).some((alias) => {
+				const normalizedAlias = normalizeName(alias);
+				return normalizedAlias.length > 0 && (normalizedQuery.includes(normalizedAlias) || normalizedAlias.includes(normalizedQuery));
+			});
+		}).slice(0, limit).map((row) => this.toEntity(row));
 	}
 	listResolvedMentionsByNormalized(params) {
 		return this.db.prepare(`SELECT mention_id, agent_id, scope, raw_text, normalized_text, proposed_type, semantic_role, source_ref,

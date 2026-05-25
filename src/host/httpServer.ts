@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { URL } from "node:url";
 import { MEMX_NATIVE_HOOK_TIMEOUT_MS } from "../timeouts.js";
-import { MemxHostService, type MemxRecallRequest } from "./service.js";
+import { MemxHostService, type MemxAgentRequest, type MemxRecallRequest } from "./service.js";
 
 const DEFAULT_PORT = 3878;
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = MEMX_NATIVE_HOOK_TIMEOUT_MS;
@@ -31,6 +31,16 @@ function authorized(req: IncomingMessage): boolean {
   return req.headers.authorization === `Bearer ${secret}`;
 }
 
+function agentRequestFromSearch(url: URL): MemxAgentRequest {
+  return {
+    hostId: url.searchParams.get("hostId") ?? undefined,
+    actorId: url.searchParams.get("actorId") ?? undefined,
+    sessionId: url.searchParams.get("sessionId") ?? undefined,
+    workspaceDir: url.searchParams.get("workspaceDir") ?? undefined,
+    project: url.searchParams.get("project") ?? undefined,
+  };
+}
+
 export async function startMemxHttpServer(options: { port?: number; host?: string } = {}): Promise<void> {
   const service = new MemxHostService();
   const port = options.port ?? Number(process.env["MEMX_PORT"] || DEFAULT_PORT);
@@ -47,11 +57,15 @@ export async function startMemxHttpServer(options: { port?: number; host?: strin
         return;
       }
       if (req.method === "GET" && url.pathname === "/v1/stats") {
-        json(res, 200, await service.stats());
+        json(res, 200, await service.stats(agentRequestFromSearch(url)));
         return;
       }
       if (req.method === "GET" && url.pathname === "/v1/audit") {
-        json(res, 200, await service.audit(Number(url.searchParams.get("limit") ?? 50)));
+        json(
+          res,
+          200,
+          await service.audit(Number(url.searchParams.get("limit") ?? 50), agentRequestFromSearch(url)),
+        );
         return;
       }
       if (req.method === "POST" && url.pathname === "/v1/observe") {

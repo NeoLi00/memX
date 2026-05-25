@@ -50,6 +50,49 @@ function tokenizeSearch(text: string): string[] {
   return tokenizeSearchTerms(text, SEARCH_STOPWORDS);
 }
 
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)
+    : [];
+}
+
+function uniqueStrings(values: Array<string | undefined | null>): string[] {
+  return [
+    ...new Set(
+      values
+        .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+        .map((value) => value.trim()),
+    ),
+  ];
+}
+
+function sourceRefsFromFactMetadata(metadata: Record<string, unknown> | undefined): string[] {
+  if (!metadata) {
+    return [];
+  }
+  const semanticAssertion = objectRecord(metadata.semanticAssertion);
+  return uniqueStrings([
+    typeof metadata.sourceRef === "string" ? metadata.sourceRef : undefined,
+    typeof semanticAssertion?.sourceRef === "string" ? semanticAssertion.sourceRef : undefined,
+    ...stringArray(metadata.sourceRefs),
+    ...stringArray(metadata.supportRefs),
+    ...stringArray(metadata.supportContentRefs),
+  ]);
+}
+
+function supportTextFromFactMetadata(metadata: Record<string, unknown> | undefined): string {
+  if (!metadata) {
+    return "";
+  }
+  const semanticAssertion = objectRecord(metadata.semanticAssertion);
+  const semanticSupport =
+    typeof semanticAssertion?.supportText === "string" ? semanticAssertion.supportText.trim() : "";
+  if (semanticSupport) {
+    return semanticSupport;
+  }
+  return typeof metadata.supportText === "string" ? metadata.supportText.trim() : "";
+}
+
 /**
  * Canonical verb prefixes the LLM policy prompt constrains predicates to.
  * Two facts with the same subject AND same verb AND similar topics are
@@ -531,15 +574,17 @@ export class FactRepo {
   }
 
   private toFact(row: FactRow): NormalizedFact {
+    const objectValueJson = safeJsonParse<Record<string, unknown> | undefined>(
+      row.object_value_json,
+      undefined,
+    );
+    const sourceRefs = sourceRefsFromFactMetadata(objectValueJson);
     return {
       factId: row.fact_id,
       canonicalSubject: row.canonical_subject,
       predicate: row.predicate,
       canonicalObject: row.canonical_object ?? undefined,
-      objectValueJson: safeJsonParse<Record<string, unknown> | undefined>(
-        row.object_value_json,
-        undefined,
-      ),
+      objectValueJson,
       scope: row.scope,
       agentId: row.agent_id,
       confidence: row.confidence,
@@ -549,8 +594,8 @@ export class FactRepo {
       createdAt: row.created_at,
       updatedAt: row.updated_at,
       materializedEpoch: row.materialized_epoch,
-      sourceRef: "",
-      provenanceText: "",
+      sourceRef: sourceRefs[0] ?? "",
+      provenanceText: supportTextFromFactMetadata(objectValueJson),
     };
   }
 }

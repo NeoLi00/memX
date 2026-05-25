@@ -137,7 +137,16 @@ test("standalone quickstart can configure Codex in one command", async () => {
   const hookConfig = JSON.parse(hookJson);
   const userPromptHook = hookConfig.hooks.UserPromptSubmit[0].hooks[0];
   assert.equal("args" in userPromptHook, false);
-  assert.match(userPromptHook.command, /memx-hook\.mjs'? codex UserPromptSubmit$/);
+  assert.match(userPromptHook.command, /memx-hook\.mjs'? codex UserPromptSubmit\b/);
+  assert.match(userPromptHook.command, /--hook-config /);
+  assert.equal(
+    existsSync(join(dir, ".memx", "hook-runtime.json")),
+    true,
+    "native hooks should receive quickstart memxUrl without relying on shell env",
+  );
+  const hookRuntime = JSON.parse(readFileSync(join(dir, ".memx", "hook-runtime.json"), "utf8"));
+  assert.equal(hookRuntime.memxUrl, "http://127.0.0.1:3878");
+  assert.equal(hookRuntime.hookTimeoutMs, 8000);
   const pluginManifest = JSON.parse(
     readFileSync(join(dir, ".memx", "codex-marketplace", "plugins", "memx", ".codex-plugin", "plugin.json"), "utf8"),
   );
@@ -254,6 +263,20 @@ test("standalone quickstart installs Claude Code native plugin hooks in one comm
     "utf8",
   );
   assert.match(hookJson, /claude-code UserPromptSubmit/);
+  assert.match(hookJson, /--hook-config/);
+  assert.equal(
+    existsSync(join(dir, ".memx", "claude-marketplace", "plugins", "memx", ".memx-hook.json")),
+    true,
+    "Claude plugin snapshot should carry the hook runtime config",
+  );
+  const hookRuntime = JSON.parse(
+    readFileSync(
+      join(dir, ".memx", "claude-marketplace", "plugins", "memx", ".memx-hook.json"),
+      "utf8",
+    ),
+  );
+  assert.equal(hookRuntime.memxUrl, "http://127.0.0.1:3878");
+  assert.equal(hookRuntime.hookTimeoutMs, 8000);
   assert.match(hookJson, /node \\"\$\{CLAUDE_PLUGIN_ROOT\}\/dist\/\.runtime\/src\/bin\/memx-hook\.mjs\\" claude-code/);
   assert.deepEqual(calls, [
     { command: "claude", args: ["plugin", "uninstall", "memx@memx"] },

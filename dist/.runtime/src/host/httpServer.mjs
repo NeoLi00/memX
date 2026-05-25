@@ -21,6 +21,15 @@ function authorized(req) {
 	if (!secret) return true;
 	return req.headers.authorization === `Bearer ${secret}`;
 }
+function agentRequestFromSearch(url) {
+	return {
+		hostId: url.searchParams.get("hostId") ?? void 0,
+		actorId: url.searchParams.get("actorId") ?? void 0,
+		sessionId: url.searchParams.get("sessionId") ?? void 0,
+		workspaceDir: url.searchParams.get("workspaceDir") ?? void 0,
+		project: url.searchParams.get("project") ?? void 0
+	};
+}
 async function startMemxHttpServer(options = {}) {
 	const service = new MemxHostService();
 	const port = options.port ?? Number(process.env["MEMX_PORT"] || DEFAULT_PORT);
@@ -43,11 +52,11 @@ async function startMemxHttpServer(options = {}) {
 				return;
 			}
 			if (req.method === "GET" && url.pathname === "/v1/stats") {
-				json(res, 200, await service.stats());
+				json(res, 200, await service.stats(agentRequestFromSearch(url)));
 				return;
 			}
 			if (req.method === "GET" && url.pathname === "/v1/audit") {
-				json(res, 200, await service.audit(Number(url.searchParams.get("limit") ?? 50)));
+				json(res, 200, await service.audit(Number(url.searchParams.get("limit") ?? 50), agentRequestFromSearch(url)));
 				return;
 			}
 			if (req.method === "POST" && url.pathname === "/v1/observe") {

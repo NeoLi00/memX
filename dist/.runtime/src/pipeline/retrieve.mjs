@@ -1,4 +1,4 @@
-import { clamp01, normalizeText, randomId, stableHash, truncateText } from "../support.mjs";
+import { clamp01, normalizeText, objectRecord, randomId, stableHash, truncateText } from "../support.mjs";
 import { snapshotMemoryLlmBudgetAudit } from "./llmBudgetAudit.mjs";
 import { compileQuery, compileQueryWithoutSemanticFallback } from "./queryCompiler.mjs";
 import { isQuestionLike, queryAnchorSupport } from "./semantic/heuristics.mjs";
@@ -59,22 +59,115 @@ function uniqueNonEmpty(values, limit = Number.POSITIVE_INFINITY) {
 function shouldUseExactSnippetSupport(queryAnalysis) {
 	return queryAnalysis.evidenceFidelity === "high" || queryAnalysis.queryShape.timeframe === "compare" || queryAnalysis.queryShape.granularity === "exact_detail" || queryAnalysis.queryShape.evidenceNeed !== "workflow_context" && queryAnalysis.candidateSurfaces.includes("chunk");
 }
-function evidenceRowFromCandidateHit(hit) {
-	const observedAt = typeof hit.metadata?.observedAt === "string" ? hit.metadata.observedAt : void 0;
+function factStatusFromMetadata(metadata) {
+	return metadata?.status === "active" || metadata?.status === "superseded" || metadata?.status === "deleted" || metadata?.status === "uncertain" ? metadata.status : void 0;
+}
+function isHistoricalFactQuery(queryAnalysis) {
+	return queryAnalysis.queryShape.timeframe === "historical" || queryAnalysis.queryShape.timeframe === "compare";
+}
+function factCandidateVisibleForQuery(queryAnalysis, metadata) {
+	const status = factStatusFromMetadata(metadata);
+	if (!status) return true;
+	if (status === "deleted") return false;
+	if (status === "superseded" && !isHistoricalFactQuery(queryAnalysis)) return false;
+	return true;
+}
+function evidenceRowFromCandidateHit(hit, store) {
+	const metadata = store ? hydrateFactCandidateMetadata(store, hit) : hit.metadata;
+	const observedAt = typeof metadata?.observedAt === "string" ? metadata.observedAt : void 0;
+	const status = factStatusFromMetadata(metadata);
+	const text = hit.surface === "fact" && typeof metadata?.canonicalSubject === "string" && typeof metadata?.predicate === "string" ? formatFactLine({
+		subject: metadata.canonicalSubject,
+		predicate: metadata.predicate,
+		object: typeof metadata.canonicalObject === "string" ? metadata.canonicalObject : void 0,
+		status: status === "superseded" || hit.supersededHint ? "superseded" : void 0
+	}) : normalizeSearchText(hit.text);
+	const sourceRef = typeof metadata?.sourceRef === "string" && metadata.sourceRef.trim() ? metadata.sourceRef.trim() : hit.lineage.sourceRef;
 	return toEvidenceRow({
 		id: hit.lineage.canonicalId ?? hit.lineage.sourceId ?? hit.docId,
-		text: normalizeSearchText(hit.text),
+		text,
 		score: hit.score,
 		scope: hit.scope,
 		confidence: hit.confidence,
 		observedAt,
-		sourceRef: hit.lineage.sourceRef,
-		lineage: hit.lineage
+		sourceRef,
+		lineage: {
+			...hit.lineage,
+			sourceRef
+		}
 	});
+}
+function factIdFromCandidateHit(hit) {
+	if (hit.surface !== "fact") return;
+	const candidates = [
+		hit.lineage.canonicalId,
+		hit.lineage.sourceId,
+		hit.docId,
+		hit.candidateId
+	];
+	for (const candidate of candidates) {
+		if (!candidate) continue;
+		return candidate.startsWith("fact:") ? candidate.slice(5) : candidate;
+	}
+}
+function semanticAssertionMetadata(fact) {
+	return objectRecord(fact.objectValueJson?.semanticAssertion);
+}
+function factSupportSourceRefs(fact) {
+	const assertion = semanticAssertionMetadata(fact);
+	return uniqueMaintenanceRefs([
+		fact.sourceRef,
+		...sourceRefsFromMaintenanceMetadata(fact.objectValueJson),
+		typeof assertion?.sourceRef === "string" ? assertion.sourceRef : void 0
+	]);
+}
+function factSupportText(fact) {
+	const assertion = semanticAssertionMetadata(fact);
+	const supportText = typeof assertion?.supportText === "string" ? assertion.supportText.trim() : "";
+	if (supportText) return supportText;
+	return fact.provenanceText?.trim() || void 0;
+}
+function hydrateFactCandidateMetadata(store, hit) {
+	if (hit.surface !== "fact") return hit.metadata;
+	const factId = factIdFromCandidateHit(hit);
+	const fact = factId ? store.factRepo.get(factId) : null;
+	if (!fact) return hit.metadata;
+	const sourceRefs = factSupportSourceRefs(fact);
+	const supportText = factSupportText(fact);
+	return {
+		...hit.metadata ?? {},
+		canonicalSubject: fact.canonicalSubject,
+		predicate: fact.predicate,
+		...fact.canonicalObject ? { canonicalObject: fact.canonicalObject } : {},
+		status: fact.status,
+		activeHint: fact.status === "active" || fact.status === "uncertain",
+		supersededHint: fact.status === "superseded",
+		currentnessHint: fact.status === "superseded" ? "historical" : "current",
+		observedAt: fact.updatedAt,
+		confidence: fact.confidence,
+		...sourceRefs[0] ? { sourceRef: sourceRefs[0] } : {},
+		...sourceRefs.length > 0 ? {
+			sourceRefs,
+			supportRefs: sourceRefs,
+			supportContentRefs: sourceRefs
+		} : {},
+		...supportText ? { supportText } : {}
+	};
+}
+function candidateDisplayText(hit, metadata) {
+	const status = factStatusFromMetadata(metadata);
+	if (hit.surface === "fact" && typeof metadata?.canonicalSubject === "string" && typeof metadata?.predicate === "string") return formatFactLine({
+		subject: metadata.canonicalSubject,
+		predicate: metadata.predicate,
+		object: typeof metadata.canonicalObject === "string" ? metadata.canonicalObject : void 0,
+		status: status === "superseded" || hit.supersededHint ? "superseded" : void 0
+	});
+	return hit.text;
 }
 function evidenceRowFromFactId(store, factId) {
 	const fact = store.factRepo.get(factId);
 	if (!fact) return null;
+	const sourceRef = factSupportSourceRefs(fact)[0] ?? fact.sourceRef;
 	return toEvidenceRow({
 		id: fact.factId,
 		text: formatFactLine({
@@ -88,19 +181,23 @@ function evidenceRowFromFactId(store, factId) {
 		scope: fact.scope,
 		confidence: fact.confidence,
 		observedAt: fact.updatedAt,
-		sourceRef: fact.sourceRef,
+		sourceRef,
+		provenance: factSupportText(fact),
 		lineage: {
 			canonicalKind: "fact",
 			canonicalId: fact.factId,
 			sourceKind: "fact",
 			sourceId: fact.factId,
-			sourceRef: fact.sourceRef,
+			sourceRef,
 			materializedEpoch: fact.materializedEpoch
 		}
 	});
 }
-function primaryCandidateRowsForSurface(result, surface) {
-	return result.candidates.filter((candidate) => candidate.surface === surface && candidate.tier === "primary").map((candidate) => evidenceRowFromCandidateHit(candidate));
+function primaryCandidateRowsForSurface(result, surface, options) {
+	return result.candidates.filter((candidate) => candidate.surface === surface && candidate.tier === "primary").map((candidate) => ({
+		candidate,
+		metadata: options?.store ? hydrateFactCandidateMetadata(options.store, candidate) : candidate.metadata
+	})).filter(({ candidate, metadata }) => candidate.surface !== "fact" || !options || factCandidateVisibleForQuery(options.queryAnalysis, metadata)).map(({ candidate }) => evidenceRowFromCandidateHit(candidate, options?.store));
 }
 function candidateSurfaceAnchorScore(row, queryAnchors) {
 	if (queryAnchors.length === 0) return 0;
@@ -836,8 +933,10 @@ function promptEvidenceNeedsCompanions(queryAnalysis) {
 }
 function promptEvidenceFromRow(params) {
 	const text = cleanPromptEvidenceText(params.row.text);
+	const supportText = params.row.provenance?.trim();
+	const scoringText = supportText ? uniqueNonEmpty([text, supportText], 6).join(" | ") : text;
 	const scored = promptEvidencePriority({
-		text,
+		text: scoringText,
 		score: params.row.score,
 		surface: params.surface,
 		source: params.source,
@@ -847,7 +946,8 @@ function promptEvidenceFromRow(params) {
 		id: params.row.id,
 		surface: params.surface,
 		text,
-		rawText: params.row.text,
+		rawText: supportText ? `${params.row.text}\n${supportText}` : params.row.text,
+		scoringText: scoringText !== text ? scoringText : void 0,
 		sourceRef: params.row.sourceRef,
 		mergedSourceRefs: params.row.lineage?.sourceRef ? uniqueNonEmpty([params.row.sourceRef ?? "", params.row.lineage.sourceRef]) : void 0,
 		metadata: promptEvidenceMetadataForRawText(params.row.text),
@@ -857,9 +957,9 @@ function promptEvidenceFromRow(params) {
 		priority: scored.priority,
 		goalScore: scored.goalScore,
 		semanticScore: scored.semanticScore,
-		coverage: evidenceCoverageForText(params.queryAnalysis, text),
-		slotCoverage: slotCoverageForText(params.queryAnalysis, text),
-		filledSlotIds: filledSlotIdsForText(params.queryAnalysis, text),
+		coverage: evidenceCoverageForText(params.queryAnalysis, scoringText),
+		slotCoverage: slotCoverageForText(params.queryAnalysis, scoringText),
+		filledSlotIds: filledSlotIdsForText(params.queryAnalysis, scoringText),
 		source: params.source,
 		role: "support"
 	};
@@ -1013,7 +1113,7 @@ function maintenanceObjectExpansionRefs(store, sourceRef, seen = /* @__PURE__ */
 	if (sourceRef.startsWith("fact:")) {
 		const fact = store.factRepo.get(sourceRef.slice(5));
 		if (!fact) return [];
-		const refs = uniqueNonEmpty([...sourceRefsFromMaintenanceMetadata(fact.objectValueJson), fact.sourceRef]);
+		const refs = factSupportSourceRefs(fact);
 		return uniqueNonEmpty([...refs, ...refs.flatMap((ref) => maintenanceObjectExpansionRefs(store, ref, seen))]);
 	}
 	if (sourceRef.startsWith("event:")) {
@@ -1391,8 +1491,10 @@ function buildPromptEvidenceCandidates(params) {
 	for (const hit of candidateHits) {
 		const surface = candidateSurfaceToPromptSurface(hit.surface);
 		if (!surface) continue;
-		const text = cleanPromptEvidenceText(hit.text);
-		const scoringText = promptEvidenceScoringTextFromMetadata(text, hit.metadata);
+		const metadata = hydrateFactCandidateMetadata(params.store, hit);
+		if (hit.surface === "fact" && !factCandidateVisibleForQuery(params.queryAnalysis, metadata)) continue;
+		const text = cleanPromptEvidenceText(candidateDisplayText(hit, metadata));
+		const scoringText = promptEvidenceScoringTextFromMetadata(text, metadata);
 		const slotCoverage = slotCoverageWithCandidateMatches(params.queryAnalysis, scoringText, hit);
 		const scored = promptEvidencePriority({
 			text: scoringText,
@@ -1412,12 +1514,12 @@ function buildPromptEvidenceCandidates(params) {
 			text,
 			rawText: hit.text,
 			scoringText,
-			sourceRef: hit.lineage.sourceRef,
-			mergedSourceRefs: sourceRefsFromCandidateMetadata(hit.metadata),
-			observedAt: typeof hit.metadata?.observedAt === "string" ? hit.metadata.observedAt : void 0,
+			sourceRef: typeof metadata?.sourceRef === "string" && metadata.sourceRef.trim() ? metadata.sourceRef.trim() : hit.lineage.sourceRef,
+			mergedSourceRefs: uniqueNonEmpty([...sourceRefsFromCandidateMetadata(metadata), hit.lineage.sourceRef]),
+			observedAt: typeof metadata?.observedAt === "string" ? metadata.observedAt : void 0,
 			excerptAnchors,
 			lineage: hit.lineage,
-			metadata: promptEvidenceMetadataForRawText(hit.text, hit.metadata),
+			metadata: promptEvidenceMetadataForRawText(hit.text, metadata),
 			priority,
 			goalScore: scored.goalScore,
 			semanticScore: scored.semanticScore,
@@ -2410,29 +2512,33 @@ async function retrieveEvidence(store, ctx, query, searchQuery = query, auditOpt
 			text: retrievalQuery,
 			limit: 2,
 			includeHistorical: true
-		}).filter((fact) => fact.status === "superseded").map((fact) => toEvidenceRow({
-			id: fact.factId,
-			text: formatFactLine({
-				subject: fact.canonicalSubject,
-				predicate: fact.predicate,
-				object: fact.canonicalObject ?? void 0,
-				objectValueJson: fact.objectValueJson,
-				status: fact.status
-			}),
-			score: .34,
-			scope: fact.scope,
-			confidence: fact.confidence,
-			sourceRef: fact.sourceRef,
-			observedAt: fact.updatedAt,
-			lineage: {
-				canonicalKind: "fact",
-				canonicalId: fact.factId,
-				sourceKind: "fact",
-				sourceId: fact.factId,
-				sourceRef: fact.sourceRef,
-				materializedEpoch: fact.materializedEpoch
-			}
-		}));
+		}).filter((fact) => fact.status === "superseded").map((fact) => {
+			const sourceRef = factSupportSourceRefs(fact)[0] ?? fact.sourceRef;
+			return toEvidenceRow({
+				id: fact.factId,
+				text: formatFactLine({
+					subject: fact.canonicalSubject,
+					predicate: fact.predicate,
+					object: fact.canonicalObject ?? void 0,
+					objectValueJson: fact.objectValueJson,
+					status: fact.status
+				}),
+				score: .34,
+				scope: fact.scope,
+				confidence: fact.confidence,
+				sourceRef,
+				observedAt: fact.updatedAt,
+				provenance: factSupportText(fact),
+				lineage: {
+					canonicalKind: "fact",
+					canonicalId: fact.factId,
+					sourceKind: "fact",
+					sourceId: fact.factId,
+					sourceRef,
+					materializedEpoch: fact.materializedEpoch
+				}
+			});
+		});
 		if (conservativeHistoricalAlternates.length > 0) {
 			alternates = dedupeEvidenceRows([...alternates, ...conservativeHistoricalAlternates].sort((left, right) => (right.score ?? 0) - (left.score ?? 0)), 6);
 			diagnostics.push("historical-backfill:alternate-only");
@@ -2485,7 +2591,10 @@ async function retrieveEvidence(store, ctx, query, searchQuery = query, auditOpt
 	if (candidateGenerationResult && shouldApplyCandidateAuthorityToMainSurface(route, queryAnalysis)) {
 		const candidateFactLimit = shouldUseExactSnippetSupport(queryAnalysis) ? 8 : 6;
 		const candidateStateRows = prioritizeCandidateRowsForMainSurface(primaryCandidateRowsForSurface(candidateGenerationResult, "state"), queryAnchors, 4);
-		const candidateFactRows = prioritizeCandidateRowsForMainSurface(primaryCandidateRowsForSurface(candidateGenerationResult, "fact"), queryAnchors, candidateFactLimit);
+		const candidateFactRows = prioritizeCandidateRowsForMainSurface(primaryCandidateRowsForSurface(candidateGenerationResult, "fact", {
+			store,
+			queryAnalysis
+		}), queryAnchors, candidateFactLimit);
 		const candidateEventRows = prioritizeCandidateRowsForMainSurface(primaryCandidateRowsForSurface(candidateGenerationResult, "event"), queryAnchors, Math.max(4, ctx.config.advanced.recallChunkBudget));
 		const candidateChunkRows = prioritizeCandidateRowsForMainSurface(primaryCandidateRowsForSurface(candidateGenerationResult, "chunk").filter((entry) => entry.provenance !== "assistant"), queryAnchors, Math.max(3, Math.min(6, ctx.config.advanced.recallChunkBudget)));
 		if (candidateStateRows.length > 0) {
@@ -3027,12 +3136,14 @@ function evidencePacketRenderLine(packet, bundle) {
 function renderEvidenceBundle(bundle, maxChars) {
 	const effectiveBudget = Math.max(220, Math.min(maxChars, bundle.budgetPlan?.totalPromptChars ?? maxChars));
 	const promptEvidenceBudget = Math.max(360, Math.floor(effectiveBudget * .86));
-	const rendered = ["## Memory Context", ...[renderBudgetedSection("Priority Evidence", bundle.evidencePackets.filter((packet) => packet.injected && !packet.dropReason).sort((left, right) => (right.grade?.finalScore ?? right.coverage.confidence) - (left.grade?.finalScore ?? left.coverage.confidence)).slice(0, 6).flatMap((packet) => {
+	const sections = [renderBudgetedSection("Priority Evidence", bundle.evidencePackets.filter((packet) => packet.injected && !packet.dropReason).sort((left, right) => (right.grade?.finalScore ?? right.coverage.confidence) - (left.grade?.finalScore ?? left.coverage.confidence)).slice(0, 6).flatMap((packet) => {
 		const displayLines = (packet.displayLines ?? []).filter((line) => line.trim().length > 0);
 		if (displayLines.length > 0) return displayLines.map((line) => line.trim().startsWith("-") ? line.trim() : `- ${line.trim()}`);
 		return [evidencePacketRenderLine(packet, bundle)];
-	}), promptEvidenceBudget)].filter(Boolean)].join("\n\n").trim();
+	}), promptEvidenceBudget)].filter(Boolean);
+	if (sections.length === 0) return "";
+	const rendered = ["## Memory Context", ...sections].join("\n\n").trim();
 	return rendered.length <= effectiveBudget ? rendered : truncateText(rendered, effectiveBudget);
 }
 //#endregion
-export { buildBackgroundRecallBundle, hasBackgroundRecallMaterial, retrieveEvidence };
+export { buildBackgroundRecallBundle, hasBackgroundRecallMaterial, renderEvidenceBundle, retrieveEvidence };

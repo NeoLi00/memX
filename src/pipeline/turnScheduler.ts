@@ -18,6 +18,7 @@ import type {
   ConversationTask,
   MemoryOperationContext,
   MemoryLlmCallStage,
+  MemoryCandidateStructuredHints,
   SynthesizedTaskEvent,
   TurnCaptureMessage,
   TurnSemanticFrame,
@@ -94,6 +95,113 @@ function shouldSuppressMessageFromSemanticMemory(
     containsSensitiveValue(content) ||
     sensitivityScore(content) > ctx.config.maxSensitivityAllowed
   );
+}
+
+function semanticDraftHasWriteSignals(hints: Partial<MemoryCandidateStructuredHints> | undefined): boolean {
+  const draft = hints?.semanticDraft;
+  return Boolean(
+    (draft?.assertionDrafts.length ?? 0) > 0 ||
+      (draft?.correctionDrafts.length ?? 0) > 0 ||
+      (draft?.relationDrafts?.length ?? 0) > 0 ||
+      (draft?.resourceAssertions?.length ?? 0) > 0 ||
+      (draft?.adviceSignals?.length ?? 0) > 0 ||
+      (hints?.resourceAssertions?.length ?? 0) > 0 ||
+      (hints?.adviceSignals?.length ?? 0) > 0,
+  );
+}
+
+function semanticOnlyCandidateText(
+  hints: Partial<MemoryCandidateStructuredHints> | undefined,
+): string | undefined {
+  if (!semanticDraftHasWriteSignals(hints)) {
+    return undefined;
+  }
+  const draft = hints?.semanticDraft;
+  const lines: string[] = [];
+  for (const assertion of draft?.assertionDrafts ?? []) {
+    const entities = (assertion.entityHints ?? []).map((entry) => entry.name).filter(Boolean);
+    const slots = assertion.slotHints?.filter(Boolean) ?? [];
+    const value = assertion.valueHint?.trim();
+    const support = assertion.supportSpans?.find((span) => span.text.trim())?.text.trim();
+    lines.push(
+      [
+        assertion.familyHint,
+        assertion.timeframeHint,
+        entities.join(" / "),
+        slots.join(" / "),
+        value,
+        support,
+      ]
+        .filter(Boolean)
+        .join(" | "),
+    );
+  }
+  for (const correction of draft?.correctionDrafts ?? []) {
+    const entry = correction.correction;
+    lines.push(
+      [
+        "correction",
+        entry.targetKind,
+        entry.canonicalKey,
+        entry.predicate,
+        entry.priorValue ? `from ${entry.priorValue}` : undefined,
+        entry.nextValue ? `to ${entry.nextValue}` : undefined,
+        entry.reason,
+      ]
+        .filter(Boolean)
+        .join(" | "),
+    );
+  }
+  for (const relation of draft?.relationDrafts ?? []) {
+    const entry = relation.relation;
+    if (entry.polarity === "negated") {
+      continue;
+    }
+    lines.push(
+      [
+        "relation",
+        entry.subject,
+        entry.predicate,
+        entry.relationSlot,
+        entry.object,
+        entry.reason,
+      ]
+        .filter(Boolean)
+        .join(" | "),
+    );
+  }
+  for (const resource of [
+    ...(draft?.resourceAssertions ?? []),
+    ...(hints?.resourceAssertions ?? []),
+  ]) {
+    lines.push(
+      [
+        "resource",
+        resource.owner,
+        resource.ownershipStatus,
+        resource.resource,
+        resource.resourceType,
+        resource.supportText,
+      ]
+        .filter(Boolean)
+        .join(" | "),
+    );
+  }
+  for (const advice of [...(draft?.adviceSignals ?? []), ...(hints?.adviceSignals ?? [])]) {
+    lines.push(
+      [
+        "advice",
+        advice.problemContext,
+        advice.userResources?.join(" / "),
+        advice.assistantRecommendation,
+        advice.supportText,
+      ]
+        .filter(Boolean)
+        .join(" | "),
+    );
+  }
+  const text = lines.filter((line) => line.trim()).join("\n").trim();
+  return text ? truncateText(text, 1200) : undefined;
 }
 
 function mapEvidenceChunkIds(chunks: ConversationChunk[], indexes: number[]): string[] {
@@ -321,13 +429,25 @@ function taskSupportRefs(chunks: ConversationChunk[] | undefined): string[] {
   ];
 }
 
+function taskVectorDocId(task: ConversationTask): string {
+  return `state:task:${task.taskId}`;
+}
+
+function recallableTaskTitle(title: string): string | undefined {
+  const trimmed = title.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  return normalizeText(trimmed) === "active task" ? undefined : trimmed;
+}
+
 function buildTaskVectorDoc(task: ConversationTask, chunks?: ConversationChunk[]) {
   const metadata = sanitizeTaskMetadata(task.metadataJson);
   const rawMetadata = objectRecord(task.metadataJson);
   const semanticSummary = semanticTaskSummaryText(task);
   const supportRefs = taskSupportRefs(chunks);
   const taskText = [
-    task.title,
+    recallableTaskTitle(task.title),
     typeof rawMetadata?.candidateResolution === "string" && rawMetadata.candidateResolution.trim()
       ? rawMetadata.candidateResolution.trim()
       : undefined,
@@ -340,8 +460,11 @@ function buildTaskVectorDoc(task: ConversationTask, chunks?: ConversationChunk[]
     .filter((value): value is string => Boolean(value))
     .join("\n")
     .trim();
+  if (!taskText) {
+    return null;
+  }
   return {
-    docId: `state:task:${task.taskId}`,
+    docId: taskVectorDocId(task),
     docKind: "state" as const,
     sourceId: `task:${task.taskId}`,
     scope: task.scope,
@@ -368,6 +491,19 @@ function buildTaskVectorDoc(task: ConversationTask, chunks?: ConversationChunk[]
     createdAt: task.startedAt,
     updatedAt: task.updatedAt,
   };
+}
+
+function upsertTaskVectorDoc(
+  store: MemxStoreBundle,
+  task: ConversationTask,
+  chunks?: ConversationChunk[],
+): void {
+  const doc = buildTaskVectorDoc(task, chunks);
+  if (!doc) {
+    store.retrievalBackend.deleteDocs([taskVectorDocId(task)]);
+    return;
+  }
+  store.retrievalBackend.upsertDocs([doc]);
 }
 
 function resolveCurrentProjectContext(params: {
@@ -650,7 +786,7 @@ export class MemxTurnScheduler {
       updatedAt: observedAt,
     };
     this.store.taskRepo.update(task.taskId, closedTask);
-    this.store.retrievalBackend.upsertDocs([buildTaskVectorDoc(closedTask, closedChunks)]);
+    upsertTaskVectorDoc(this.store, closedTask, closedChunks);
     return closedTask;
   }
 
@@ -662,9 +798,7 @@ export class MemxTurnScheduler {
       updatedAt: observedAt,
     };
     this.store.taskRepo.update(task.taskId, reopenedTask);
-    this.store.retrievalBackend.upsertDocs([
-      buildTaskVectorDoc(reopenedTask, this.store.chunkRepo.listByTask(reopenedTask.taskId)),
-    ]);
+    upsertTaskVectorDoc(this.store, reopenedTask, this.store.chunkRepo.listByTask(reopenedTask.taskId));
     return reopenedTask;
   }
 
@@ -976,11 +1110,14 @@ export class MemxTurnScheduler {
       message,
     });
     const sourceRef = message.sourceRef || `${message.role}:${message.turnId}`;
+    const compilerHints = frameHintsForSourceRef(turnSemanticFrame, sourceRef);
+    const assistantSemanticText =
+      message.role === "assistant" ? semanticOnlyCandidateText(compilerHints) : undefined;
 
     const candidate = buildCandidate({
       sourceKind:
         message.role === "tool" ? "tool" : message.role === "assistant" ? "assistant" : "user",
-      rawText: message.content,
+      rawText: message.role === "assistant" ? assistantSemanticText ?? "" : message.content,
       observedAt: message.observedAt,
       config: ctx.config,
       source: {
@@ -994,6 +1131,7 @@ export class MemxTurnScheduler {
         taskId: activeTask.taskId,
         chunkSummary: chunk.summary,
         sourceRef,
+        ...(message.role === "assistant" ? { assistantSemanticOnly: Boolean(assistantSemanticText) } : {}),
         sourceGroupId: sourceSegments[0]?.sourceGroupId,
         segmentRefs: sourceSegments.map((segment) => segment.segmentId),
         segmentCount: sourceSegments.length,
@@ -1002,10 +1140,12 @@ export class MemxTurnScheduler {
         ...projectContext,
       },
     });
-    if (!candidate || message.role === "assistant") {
+    if (!candidate) {
       return;
     }
-    const compilerHints = frameHintsForSourceRef(turnSemanticFrame, sourceRef);
+    if (message.role === "assistant" && !assistantSemanticText) {
+      return;
+    }
     const candidateForPolicy = compilerHints
       ? {
           ...candidate,
@@ -1139,6 +1279,6 @@ export class MemxTurnScheduler {
       updatedAt: messages.at(-1)?.observedAt ?? ctx.now,
     };
     this.store.taskRepo.update(activeTask.taskId, updatedTask);
-    this.store.retrievalBackend.upsertDocs([buildTaskVectorDoc(updatedTask, taskChunks)]);
+    upsertTaskVectorDoc(this.store, updatedTask, taskChunks);
   }
 }

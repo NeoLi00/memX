@@ -311,7 +311,23 @@ export class GraphRepo {
       )
       .all() as EntityRow[];
     return rows
-      .filter((row) => normalizedQuery.includes(row.normalized_name))
+      .filter((row) => {
+        if (
+          normalizedQuery.includes(row.normalized_name) ||
+          row.normalized_name.includes(normalizedQuery)
+        ) {
+          return true;
+        }
+        const aliases = safeJsonParse<string[]>(row.aliases_json, []);
+        return aliases.some((alias) => {
+          const normalizedAlias = normalizeName(alias);
+          return (
+            normalizedAlias.length > 0 &&
+            (normalizedQuery.includes(normalizedAlias) ||
+              normalizedAlias.includes(normalizedQuery))
+          );
+        });
+      })
       .slice(0, limit)
       .map((row) => this.toEntity(row));
   }

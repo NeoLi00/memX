@@ -5,7 +5,7 @@ import { homedir, platform } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_MEMORY_CONFIG } from "../config.js";
-import { MEMX_NATIVE_HOOK_TIMEOUT_SECONDS } from "../timeouts.js";
+import { MEMX_NATIVE_HOOK_TIMEOUT_MS, MEMX_NATIVE_HOOK_TIMEOUT_SECONDS } from "../timeouts.js";
 import type { MemoryEmbeddingProvider, MemoryLlmProvider, MemoryPluginConfig } from "../types.js";
 import {
   applyClaudeJsonConnect,
@@ -143,6 +143,10 @@ function localClaudeMarketplaceDir(homeDir: string): string {
   return join(homeDir, ".memx", DEFAULT_CLAUDE_MARKETPLACE_DIRNAME);
 }
 
+function hookRuntimeConfigPath(homeDir: string): string {
+  return join(homeDir, ".memx", "hook-runtime.json");
+}
+
 function currentRuntimeRoot(): string {
   return fileURLToPath(new URL("../../", import.meta.url));
 }
@@ -172,8 +176,16 @@ function hookCommandLine(
   commandConfig: McpCommandConfig,
   host: "codex" | "claude-code",
   eventName: string,
+  hookConfigPath?: string,
 ): string {
-  return [...[commandConfig.command, ...commandConfig.args], host, eventName].map(shellQuote).join(" ");
+  return [
+    ...[commandConfig.command, ...commandConfig.args],
+    host,
+    eventName,
+    ...(hookConfigPath ? ["--hook-config", hookConfigPath] : []),
+  ]
+    .map(shellQuote)
+    .join(" ");
 }
 
 function normalizeEmbeddingProvider(
@@ -347,6 +359,18 @@ async function writeAtomic(path: string, text: string): Promise<void> {
   await rename(tmp, path);
 }
 
+async function writeHookRuntimeConfig(
+  path: string,
+  options: NormalizedStandaloneOptions,
+): Promise<void> {
+  const config = {
+    memxUrl: options.memxUrl,
+    ...(options.memxSecret ? { memxSecret: options.memxSecret } : {}),
+    hookTimeoutMs: MEMX_NATIVE_HOOK_TIMEOUT_MS,
+  };
+  await writeAtomic(path, `${JSON.stringify(config, null, 2)}\n`);
+}
+
 function settingSnapshot(record: Record<string, unknown>, key: string): Record<string, unknown> {
   return Object.hasOwn(record, key)
     ? { present: true, value: record[key] }
@@ -435,13 +459,14 @@ function hookEntry(
   commandConfig: McpCommandConfig,
   host: "codex" | "claude-code",
   eventName: string,
+  hookConfigPath?: string,
   statusMessage?: string,
 ) {
   return {
     hooks: [
       {
         type: "command",
-        command: hookCommandLine(commandConfig, host, eventName),
+        command: hookCommandLine(commandConfig, host, eventName, hookConfigPath),
         timeout: MEMX_NATIVE_HOOK_TIMEOUT_SECONDS,
         ...(statusMessage ? { statusMessage } : {}),
       },
@@ -449,24 +474,39 @@ function hookEntry(
   };
 }
 
-function codexHooksConfig(commandConfig: McpCommandConfig): Record<string, unknown> {
+function codexHooksConfig(
+  commandConfig: McpCommandConfig,
+  hookConfigPath?: string,
+): Record<string, unknown> {
   return {
     hooks: {
       SessionStart: [
-        hookEntry(commandConfig, "codex", "SessionStart", "memx: opening memory session"),
+        hookEntry(
+          commandConfig,
+          "codex",
+          "SessionStart",
+          hookConfigPath,
+          "memx: opening memory session",
+        ),
       ],
       UserPromptSubmit: [
-        hookEntry(commandConfig, "codex", "UserPromptSubmit", "memx: recalling memory"),
+        hookEntry(
+          commandConfig,
+          "codex",
+          "UserPromptSubmit",
+          hookConfigPath,
+          "memx: recalling memory",
+        ),
       ],
       PreToolUse: [
         {
           matcher: "Edit|Write|Read|Glob|Grep|apply_patch|exec_command",
-          ...hookEntry(commandConfig, "codex", "PreToolUse"),
+          ...hookEntry(commandConfig, "codex", "PreToolUse", hookConfigPath),
         },
       ],
-      PostToolUse: [hookEntry(commandConfig, "codex", "PostToolUse")],
-      PreCompact: [hookEntry(commandConfig, "codex", "PreCompact")],
-      Stop: [hookEntry(commandConfig, "codex", "Stop")],
+      PostToolUse: [hookEntry(commandConfig, "codex", "PostToolUse", hookConfigPath)],
+      PreCompact: [hookEntry(commandConfig, "codex", "PreCompact", hookConfigPath)],
+      Stop: [hookEntry(commandConfig, "codex", "Stop", hookConfigPath)],
     },
   };
 }
@@ -556,12 +596,18 @@ function claudeMarketplaceManifest(): Record<string, unknown> {
   };
 }
 
-function claudeHooksConfig(): Record<string, unknown> {
+function claudeHookConfigArg(path: string): string {
+  return path.includes("${CLAUDE_PLUGIN_ROOT}") ? `"${path}"` : shellQuote(path);
+}
+
+function claudeHooksConfig(
+  hookConfigPath = "${CLAUDE_PLUGIN_ROOT}/.memx-hook.json",
+): Record<string, unknown> {
   const hook = (eventName: string) => ({
     hooks: [
       {
         type: "command",
-        command: `node "\${CLAUDE_PLUGIN_ROOT}/dist/.runtime/src/bin/memx-hook.mjs" claude-code ${eventName}`,
+        command: `node "\${CLAUDE_PLUGIN_ROOT}/dist/.runtime/src/bin/memx-hook.mjs" claude-code ${eventName} --hook-config ${claudeHookConfigArg(hookConfigPath)}`,
         timeout: MEMX_NATIVE_HOOK_TIMEOUT_SECONDS,
       },
     ],
@@ -643,6 +689,7 @@ async function installClaudeMarketplaceSnapshot(
     `${JSON.stringify(claudeHooksConfig(), null, 2)}\n`,
     "utf8",
   );
+  await writeHookRuntimeConfig(join(tmp, tmpPluginDir, ".memx-hook.json"), options);
   await mkdir(join(tmp, tmpPluginDir, "dist"), { recursive: true });
   await cp(currentRuntimeRoot(), join(tmp, tmpPluginDir, "dist", ".runtime"), { recursive: true });
   await rm(marketplaceDir, { recursive: true, force: true });
@@ -655,6 +702,7 @@ async function installCodexMarketplaceSnapshot(
   options: NormalizedStandaloneOptions,
   hookCommandConfig: McpCommandConfig,
   mcpTools: McpToolsProfile,
+  hookConfigPath?: string,
 ): Promise<string> {
   const includeMcp = mcpTools !== "none";
   const marketplaceDir = options.codexMarketplaceDir;
@@ -664,7 +712,7 @@ async function installCodexMarketplaceSnapshot(
   await mkdir(join(tmp, ".agents", "plugins"), { recursive: true });
   await mkdir(join(tmp, "plugins", "memx", ".codex-plugin"), { recursive: true });
   await mkdir(join(tmp, "plugins", "memx", "hooks"), { recursive: true });
-  const hooksJson = `${JSON.stringify(codexHooksConfig(hookCommandConfig), null, 2)}\n`;
+  const hooksJson = `${JSON.stringify(codexHooksConfig(hookCommandConfig, hookConfigPath), null, 2)}\n`;
   await writeFile(
     join(tmp, ".agents", "plugins", "marketplace.json"),
     `${JSON.stringify(codexMarketplaceManifest(), null, 2)}\n`,
@@ -702,10 +750,11 @@ async function installCodexPlugin(
   options: NormalizedStandaloneOptions,
   hookCommandConfig: McpCommandConfig,
   mcpTools: McpToolsProfile,
+  hookConfigPath: string,
   runCommand: (command: string, args: string[]) => Promise<StandaloneQuickstartCommandResult>,
   runBestEffortCommand: (command: string, args: string[]) => Promise<StandaloneQuickstartCommandResult>,
 ): Promise<Record<string, unknown>> {
-  await installCodexMarketplaceSnapshot(options, hookCommandConfig, mcpTools);
+  await installCodexMarketplaceSnapshot(options, hookCommandConfig, mcpTools, hookConfigPath);
   await removeCodexPluginCache(options.homeDir);
   const warnings: string[] = [];
   const bestEffort = async (args: string[]) => {
@@ -963,6 +1012,8 @@ export async function runStandaloneMemxQuickstart(
   if (!options.dryRun) {
     await installStandaloneRuntime(options.runtimeDir);
     await writeAtomic(options.configPath, `${JSON.stringify(next, null, 2)}\n`);
+    const hookConfigPath = hookRuntimeConfigPath(options.homeDir);
+    await writeHookRuntimeConfig(hookConfigPath, options);
     const runCommand = deps.runCommand ?? defaultRunCommand;
     const runBestEffortCommand = deps.runCommand ?? defaultRunCommandQuiet;
     if (options.target === "codex" && !options.skipCodexPluginInstall) {
@@ -970,6 +1021,7 @@ export async function runStandaloneMemxQuickstart(
         options,
         hookCommandConfig,
         mcpTools,
+        hookConfigPath,
         runCommand,
         runBestEffortCommand,
       );

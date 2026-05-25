@@ -481,7 +481,7 @@ type NormalizedEntity = {
   aliases: string[];
   confidence: number;
 };
-type EntityResolutionMethod = "exact" | "alias" | "project_identity" | "cooccurrence" | "embedding_candidate" | "llm_candidate" | "identity_link" | "new_entity" | "uncertain";
+type EntityResolutionMethod = "exact" | "alias" | "project_identity" | "identity_anchor" | "cooccurrence" | "embedding_candidate" | "llm_candidate" | "identity_link" | "new_entity" | "uncertain";
 type EntityIdentityLinkType = "same_as" | "duplicate_of" | "possible_same_as" | "supersedes";
 type EntityMentionSemanticRole = "subject" | "object" | "resource" | "project" | "person" | "query" | "support";
 type EntityMention = {
@@ -543,7 +543,7 @@ type EntityResolutionCandidate = {
   graphNeighborhoodOverlap: number;
   recency: number;
   contradictionPenalty: number;
-  source: "profile_vector" | "name_search" | "mention_history";
+  source: "profile_vector" | "identity_anchor" | "name_search" | "mention_history";
   metadataJson?: Record<string, unknown>;
 };
 type EntityDisambiguationDecision = {

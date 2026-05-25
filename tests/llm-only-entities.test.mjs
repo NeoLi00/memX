@@ -1418,6 +1418,122 @@ test("normalization canonicalizes LLM attribute predicate aliases before materia
   assert.equal(outputs.facts.some((fact) => fact.predicate === "uses_export_format"), false);
 });
 
+test("normalization canonicalizes multilingual default component slots and persists fact support lineage", () => {
+  const outputs = normalizeCandidate(
+    {
+      candidateId: "candidate_llm_multilingual_slot_alias",
+      source: {
+        kind: "user",
+        sessionKey: "s1",
+      },
+      observedAt,
+      rawText: "这个就不要再考虑了，之后 BlueHarbor 支付服务默认用 Pulsar。",
+      normalizedText: "这个就不要再考虑了 之后 blueharbor 支付服务默认用 pulsar",
+      eventType: "conversation_turn",
+      structuredHints: {
+        entities: [
+          { name: "BlueHarbor 支付服务", type: "service" },
+          { name: "Pulsar", type: "concept" },
+        ],
+        semanticDraft: {
+          sourceRef: "user:turn-llm-multilingual-alias",
+          assertionDrafts: [
+            {
+              draftId: "draft-llm-multilingual-alias-assertion",
+              sourceRef: "user:turn-llm-multilingual-alias",
+              familyHint: "fact_like",
+              timeframeHint: "current",
+              entityHints: [
+                { name: "BlueHarbor 支付服务", type: "service" },
+                { name: "Pulsar", type: "concept" },
+              ],
+              slotHints: ["默认消息队列"],
+              valueHint: "Pulsar",
+              confidence: 0.92,
+            },
+          ],
+          correctionDrafts: [
+            {
+              sourceRef: "user:turn-llm-multilingual-alias",
+              correction: {
+                timeframe: "current",
+                targetKind: "fact",
+                canonicalKey: "BlueHarbor 支付服务.default_message_queue",
+                predicate: "set_default",
+                priorValue: "NATS",
+                nextValue: "Pulsar",
+                confidence: 0.92,
+              },
+              confidence: 0.92,
+            },
+          ],
+          relationDrafts: [],
+          supportSpans: [
+            {
+              sourceRef: "user:turn-llm-multilingual-alias",
+              text: "之后 BlueHarbor 支付服务默认用 Pulsar。",
+            },
+          ],
+          compilerProvenance: {
+            source: "llm",
+            mode: "llm",
+          },
+        },
+        materializationHint: {
+          sourceRef: "user:turn-llm-multilingual-alias",
+          primaryFamily: "fact_like",
+          timeframeHint: "current",
+          replacementMode: "supersede_fact",
+        },
+        correctionHint: true,
+        correction: {
+          timeframe: "current",
+          targetKind: "fact",
+          canonicalKey: "BlueHarbor 支付服务.default_message_queue",
+          predicate: "set_default",
+          priorValue: "NATS",
+          nextValue: "Pulsar",
+          confidence: 0.92,
+        },
+      },
+      metadata: {
+        sourceRef: "user:turn-llm-multilingual-alias",
+      },
+      classification: "stable-fact",
+      policy: {
+        salienceScore: 0.95,
+        expectedFutureUtility: 0.9,
+        sensitivityScore: 0,
+        stabilityScore: 0.9,
+        action: "stable_fact",
+        reasons: ["semantic-draft-adapter:fact-correction"],
+        explicitIntent: true,
+        captureAuthorized: true,
+      },
+      confidence: 0.92,
+      scope: "agent:main",
+    },
+    minimalCtx(),
+  );
+
+  const blueHarborFacts = outputs.facts.filter((fact) => fact.canonicalSubject === "blueharbor 支付服务");
+  assert.ok(blueHarborFacts.length >= 1);
+  assert.deepEqual([...new Set(blueHarborFacts.map((fact) => fact.predicate))], [
+    "has_default_message_queue",
+  ]);
+  assert.ok(blueHarborFacts.every((fact) => fact.canonicalObject === "pulsar"));
+  assert.ok(
+    blueHarborFacts.every((fact) =>
+      fact.objectValueJson?.supportContentRefs?.includes("user:turn-llm-multilingual-alias"),
+    ),
+  );
+  assert.ok(
+    blueHarborFacts.every((fact) =>
+      String(fact.objectValueJson?.supportText ?? "").includes("BlueHarbor"),
+    ),
+  );
+});
+
 test("reasoner summaries and topic judgments do not rebuild semantics without LLM", async () => {
   const reasoner = new MemxReasoner(minimalConfig(), {
     debug() {},

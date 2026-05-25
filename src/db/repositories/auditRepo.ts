@@ -282,6 +282,120 @@ export class AuditRepo {
     return row?.createdAt ?? undefined;
   }
 
+  listRetrievals(params: { agentId: string; limit?: number }): RetrievalAuditRecord[] {
+    const limit = Math.max(1, Math.min(Math.trunc(params.limit ?? 50), 200));
+    return this.db
+      .prepare(
+        `SELECT audit_id, agent_id, scope, route_type, query_text, query_hash, selected_items_json,
+                injected_chars, created_at
+           FROM retrieval_audit
+          WHERE agent_id = ?
+          ORDER BY created_at DESC, rowid DESC
+          LIMIT ${limit}`,
+      )
+      .all(params.agentId)
+      .map((row) => {
+        const record = row as {
+          audit_id: string;
+          agent_id: string;
+          scope: string;
+          route_type: RetrievalAuditRecord["routeType"];
+          query_text: string;
+          query_hash: string;
+          selected_items_json: string;
+          injected_chars: number;
+          created_at: string;
+        };
+        return {
+          auditId: record.audit_id,
+          agentId: record.agent_id,
+          scope: record.scope,
+          routeType: record.route_type,
+          queryText: record.query_text,
+          queryHash: record.query_hash,
+          selectedItemsJson: safeJsonParse<Record<string, unknown>>(
+            record.selected_items_json,
+            {},
+          ),
+          injectedChars: record.injected_chars,
+          createdAt: record.created_at,
+        } satisfies RetrievalAuditRecord;
+      });
+  }
+
+  listPolicyDecisions(params: { agentId: string; limit?: number }): Array<Record<string, unknown>> {
+    const limit = Math.max(1, Math.min(Math.trunc(params.limit ?? 50), 200));
+    return this.db
+      .prepare(
+        `SELECT decision_id, agent_id, source_ref, candidate_hash, salience_score, utility_score,
+                chosen_action, reasons_json, created_at, metadata_json
+           FROM policy_decisions
+          WHERE agent_id = ?
+          ORDER BY created_at DESC, rowid DESC
+          LIMIT ${limit}`,
+      )
+      .all(params.agentId)
+      .map((row) => {
+        const record = row as {
+          decision_id: string;
+          agent_id: string;
+          source_ref: string;
+          candidate_hash: string;
+          salience_score: number;
+          utility_score: number;
+          chosen_action: string;
+          reasons_json: string;
+          created_at: string;
+          metadata_json: string;
+        };
+        return {
+          decisionId: record.decision_id,
+          agentId: record.agent_id,
+          sourceRef: record.source_ref,
+          candidateHash: record.candidate_hash,
+          salienceScore: record.salience_score,
+          utilityScore: record.utility_score,
+          chosenAction: record.chosen_action,
+          reasons: safeJsonParse<string[]>(record.reasons_json, []),
+          metadataJson: safeJsonParse<Record<string, unknown>>(record.metadata_json, {}),
+          createdAt: record.created_at,
+        };
+      });
+  }
+
+  listMaintenanceRuns(params: { agentId: string; limit?: number }): MaintenanceRunRecord[] {
+    const limit = Math.max(1, Math.min(Math.trunc(params.limit ?? 50), 200));
+    return this.db
+      .prepare(
+        `SELECT run_id, agent_id, job_type, stats_json, started_at, completed_at, status
+           FROM maintenance_runs
+          WHERE agent_id = ?
+          ORDER BY started_at DESC, rowid DESC
+          LIMIT ${limit}`,
+      )
+      .all(params.agentId)
+      .map((row) => {
+        const record = row as {
+          run_id: string;
+          agent_id: string;
+          job_type: string;
+          stats_json: string;
+          started_at: string;
+          completed_at: string | null;
+          status: MaintenanceRunRecord["status"];
+        };
+        return {
+          runId: record.run_id,
+          agentId: record.agent_id,
+          jobType: record.job_type,
+          statsJson: safeJsonParse<Record<string, unknown>>(record.stats_json, {}),
+          startedAt: record.started_at,
+          completedAt: record.completed_at ?? undefined,
+          status: record.status,
+        } satisfies MaintenanceRunRecord;
+      });
+  }
+
   startMaintenance(params: {
     agentId: string;
     jobType: string;

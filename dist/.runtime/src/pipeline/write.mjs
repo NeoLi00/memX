@@ -91,6 +91,120 @@ function buildProjectProfileDocs(params) {
 		updatedAt: params.fact.updatedAt
 	};
 }
+function normalizedFactStableId(fact) {
+	return stableHash([
+		fact.agentId,
+		fact.scope,
+		fact.canonicalSubject,
+		fact.predicate,
+		fact.canonicalObject ?? JSON.stringify(fact.objectValueJson ?? {})
+	]);
+}
+function formatFactVectorTextForWrite(fact) {
+	return fact.canonicalObject ? `${fact.canonicalSubject} ${fact.predicate} ${fact.canonicalObject}` : `${fact.canonicalSubject} ${fact.predicate} ${JSON.stringify(fact.objectValueJson ?? {})}`;
+}
+function metadataWithoutCanonicalObject(metadata) {
+	const next = { ...metadata };
+	delete next.canonicalObject;
+	return next;
+}
+function rewriteFactVectorDoc(doc, fact) {
+	const metadata = objectRecord(doc.metadataJson) ?? {};
+	const lineage = objectRecord(metadata.lineage) ?? {};
+	const sourceRef = fact.sourceRef ?? (typeof metadata.sourceRef === "string" && metadata.sourceRef.trim() ? metadata.sourceRef.trim() : void 0);
+	const mergedMetadata = {
+		...metadata,
+		canonicalSubject: fact.canonicalSubject,
+		predicate: fact.predicate,
+		...fact.canonicalObject ? { canonicalObject: fact.canonicalObject } : {},
+		canonicalKind: "fact",
+		canonicalId: fact.factId,
+		sourceKind: "fact",
+		sourceId: fact.factId,
+		...sourceRef ? { sourceRef } : {},
+		lineage: {
+			...lineage,
+			canonicalKind: "fact",
+			canonicalId: fact.factId,
+			sourceKind: "fact",
+			sourceId: fact.factId,
+			...sourceRef ? { sourceRef } : {},
+			...typeof fact.materializedEpoch === "number" ? { materializedEpoch: fact.materializedEpoch } : {}
+		}
+	};
+	const nextMetadata = fact.canonicalObject ? mergedMetadata : metadataWithoutCanonicalObject(mergedMetadata);
+	return {
+		...doc,
+		docId: `fact:${fact.factId}`,
+		sourceId: fact.factId,
+		text: formatFactVectorTextForWrite(fact),
+		metadataJson: nextMetadata,
+		updatedAt: fact.updatedAt
+	};
+}
+function mapCanonicalInputName(mappings, input, canonical) {
+	const inputKey = normalizeName(input ?? "");
+	const canonicalKey = normalizeName(canonical);
+	if (!inputKey || !canonicalKey) return;
+	mappings.set(inputKey, canonicalKey);
+}
+function rewriteFactsForResolvedEntities(normalized, canonicalNameByInputName) {
+	if (canonicalNameByInputName.size === 0 || normalized.facts.length === 0) return;
+	const replacementsByOldFactId = /* @__PURE__ */ new Map();
+	normalized.facts = normalized.facts.map((fact) => {
+		const canonicalSubject = canonicalNameByInputName.get(fact.canonicalSubject);
+		const canonicalObject = fact.canonicalObject ? canonicalNameByInputName.get(fact.canonicalObject) : void 0;
+		if ((!canonicalSubject || canonicalSubject === fact.canonicalSubject) && (!canonicalObject || canonicalObject === fact.canonicalObject)) return fact;
+		const rewritten = {
+			...fact,
+			canonicalSubject: canonicalSubject ?? fact.canonicalSubject,
+			canonicalObject: canonicalObject ?? fact.canonicalObject
+		};
+		rewritten.factId = normalizedFactStableId(rewritten);
+		replacementsByOldFactId.set(fact.factId, rewritten);
+		return rewritten;
+	});
+	if (replacementsByOldFactId.size === 0) return;
+	normalized.vectorDocs = normalized.vectorDocs.map((doc) => {
+		if (doc.docKind !== "fact") return doc;
+		const docReplacement = replacementsByOldFactId.get(doc.sourceId) ?? (doc.docId.startsWith("fact:") ? replacementsByOldFactId.get(doc.docId.slice(5)) : void 0);
+		return docReplacement ? rewriteFactVectorDoc(doc, docReplacement) : doc;
+	});
+}
+function shouldResolveFactEntityName(value) {
+	const normalized = normalizeName(value ?? "");
+	return Boolean(normalized && normalized !== "user" && normalized !== "assistant" && normalized !== "system");
+}
+function addResolvedFactEntityNameMappings(store, ctx, candidate, facts, canonicalNameByInputName) {
+	const sourceRef = buildSourceRef(candidate);
+	const turnIndex = candidateTurnIndex(candidate);
+	const seen = /* @__PURE__ */ new Set();
+	for (const fact of facts) for (const [role, rawName] of [["subject", fact.canonicalSubject], ["object", fact.canonicalObject]]) {
+		if (!shouldResolveFactEntityName(rawName)) continue;
+		const normalizedName = normalizeName(rawName);
+		if (seen.has(normalizedName)) continue;
+		seen.add(normalizedName);
+		const result = resolveEntityMention(store, ctx, buildEntityMention({
+			ctx,
+			scope: fact.scope,
+			rawText: rawName,
+			proposedType: "unknown",
+			semanticRole: role,
+			sourceRef: fact.sourceRef ?? sourceRef,
+			supportText: fact.provenanceText ?? candidate.rawText,
+			observedAt: fact.updatedAt,
+			sessionKey: candidate.source.sessionKey,
+			turnIndex,
+			metadataJson: {
+				reason: "fact-canonical-name-resolution",
+				factId: fact.factId,
+				predicate: fact.predicate,
+				role
+			}
+		}), { createIfMissing: false });
+		if (result.method !== "uncertain" && result.entity.normalizedName) mapCanonicalInputName(canonicalNameByInputName, rawName, result.entity.normalizedName);
+	}
+}
 function buildProjectProfileEdgeDoc(edge) {
 	return {
 		docId: `edge:${edge.edgeId}`,
@@ -390,9 +504,11 @@ function persistStructuredEntityMentions(store, ctx, candidate) {
 	return created;
 }
 function resolveGraphEntities(store, ctx, candidate, entities, edges) {
+	const canonicalNameByInputName = /* @__PURE__ */ new Map();
 	if (entities.length === 0) return {
 		entities,
-		edges
+		edges,
+		canonicalNameByInputName
 	};
 	const sourceRef = buildSourceRef(candidate);
 	const turnIndex = candidateTurnIndex(candidate);
@@ -435,6 +551,10 @@ function resolveGraphEntities(store, ctx, candidate, entities, edges) {
 				originalEntityId: entity.entityId
 			}
 		});
+		mapCanonicalInputName(canonicalNameByInputName, entity.normalizedName, canonical.normalizedName);
+		mapCanonicalInputName(canonicalNameByInputName, entity.canonicalName, canonical.normalizedName);
+		mapCanonicalInputName(canonicalNameByInputName, result.mention.rawText, canonical.normalizedName);
+		for (const alias of entity.aliases) mapCanonicalInputName(canonicalNameByInputName, alias, canonical.normalizedName);
 		entityIdMap.set(entity.entityId, canonical.entityId);
 		canonicalEntities.set(canonical.entityId, canonical);
 	}
@@ -445,7 +565,8 @@ function resolveGraphEntities(store, ctx, candidate, entities, edges) {
 	}));
 	return {
 		entities: [...canonicalEntities.values()],
-		edges: rewrittenEdges
+		edges: rewrittenEdges,
+		canonicalNameByInputName
 	};
 }
 function persistIdentityLinkForGraphEdge(store, ctx, edge) {
@@ -553,6 +674,8 @@ function writeCandidate(store, ctx, candidate) {
 		const refreshedGraph = resolveGraphEntities(store, ctx, candidate, normalized.entities, normalized.edges);
 		normalized.entities = refreshedGraph.entities;
 		normalized.edges = refreshedGraph.edges;
+		addResolvedFactEntityNameMappings(store, ctx, candidate, normalized.facts, refreshedGraph.canonicalNameByInputName);
+		rewriteFactsForResolvedEntities(normalized, refreshedGraph.canonicalNameByInputName);
 		for (const transition of projectStateTransitions) {
 			const projectCode = projectCodeFromStateKey(transition.state.key);
 			if (!projectCode) continue;

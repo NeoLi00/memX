@@ -853,9 +853,9 @@ function isWorkflowControlObject(object) {
 function shouldSuppressTargetBridge(object, hasDurableGraph) {
 	if (isWorkflowControlObject(object)) return true;
 	if (object.kind === "event" && object.attributes.relational) return true;
+	if (object.kind === "fact" && object.attributes.factSubject && object.attributes.factPredicate && object.attributes.factObject) return true;
 	if (!hasDurableGraph) return false;
 	if (object.kind === "task") return true;
-	if (object.kind === "fact" && object.attributes.factSubject && object.attributes.factPredicate && object.attributes.factObject) return true;
 	if (object.kind === "state") return (object.attributes.stateKey ?? "").startsWith("project.");
 	return false;
 }

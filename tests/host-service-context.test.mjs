@@ -105,7 +105,7 @@ test("native recall context can focus injected evidence on LLM query entities", 
   );
 });
 
-test("native recall context trusts source-grounded assembled evidence", async () => {
+test("native recall context withholds weak source-grounded assembled evidence", async () => {
   const { assessNativeContextEligibility } = await import("../dist/.runtime/src/host/service.mjs");
 
   const result = assessNativeContextEligibility(
@@ -148,11 +148,58 @@ test("native recall context trusts source-grounded assembled evidence", async ()
     },
   );
 
-  assert.equal(result.eligible, true);
-  assert.equal(result.reason, "assembled-source-evidence");
+  assert.equal(result.eligible, false);
+  assert.equal(result.reason, "weak-evidence");
 });
 
-test("native recall context can inject direct facts when packet assembly is sparse", async () => {
+test("native recall context trusts strong source-grounded assembled evidence", async () => {
+  const { assessNativeContextEligibility } = await import("../dist/.runtime/src/host/service.mjs");
+
+  const result = assessNativeContextEligibility(
+    "InvoicePilot 默认数据库是什么？",
+    {
+      queryEntities: [{ name: "InvoicePilot", type: "project", role: "subject" }],
+      suppressedEntities: [],
+    },
+    {
+      routeType: "mixed",
+      routeConfidence: 0.42,
+      states: [],
+      tasks: [],
+      facts: [],
+      events: [],
+      graph: { nodes: [], edges: [], pathCandidates: [], paths: [] },
+      alternates: [],
+      diagnostics: [],
+      behavioralGuidance: [],
+      recalledChunkIds: [],
+      recalledChunkTexts: [],
+      promptEvidence: [],
+      evidencePackets: [
+        {
+          ...packet("packet-db", "InvoicePilot 默认数据库是 PostgreSQL", ["InvoicePilot"]),
+          coverage: { filled: true, missing: [], confidence: 0.74 },
+          grade: {
+            retrievalScore: 0.78,
+            answerScore: 0.76,
+            contextBindingScore: 0.72,
+            slotCoverageScore: 0.74,
+            authorityScore: 0.82,
+            finalScore: 0.74,
+          },
+          displayLines: ["[answer] InvoicePilot 默认数据库是 PostgreSQL"],
+          sourceRefs: ["fact:invoicepilot-db"],
+        },
+      ],
+      renderedBlock: "[answer] InvoicePilot 默认数据库是 PostgreSQL",
+    },
+  );
+
+  assert.equal(result.eligible, true);
+  assert.equal(result.reason, "llm-query-entities");
+});
+
+test("native recall context withholds direct rows when packet assembly has no injectable evidence", async () => {
   const { assessNativeContextEligibility } = await import("../dist/.runtime/src/host/service.mjs");
 
   const result = assessNativeContextEligibility(
@@ -183,6 +230,46 @@ test("native recall context can inject direct facts when packet assembly is spar
     },
   );
 
-  assert.equal(result.eligible, true);
-  assert.equal(result.reason, "direct-structured-evidence");
+  assert.equal(result.eligible, false);
+  assert.equal(result.reason, "no-injected-packets");
+});
+
+test("native recall context renders only injected evidence packets", async () => {
+  const { formatNativeRecallContext } = await import("../dist/.runtime/src/host/service.mjs");
+
+  const context = formatNativeRecallContext(
+    {
+      routeType: "mixed",
+      routeConfidence: 0.9,
+      states: [],
+      tasks: [],
+      facts: [row("fact-old", "银杏仪表盘 默认导出格式是 CSV")],
+      events: [],
+      graph: {
+        nodes: [],
+        edges: [],
+        pathCandidates: [],
+        paths: ["银杏仪表盘 --contradicts--> NimbusLedger"],
+      },
+      alternates: [],
+      diagnostics: [],
+      behavioralGuidance: [],
+      recalledChunkIds: [],
+      recalledChunkTexts: [],
+      promptEvidence: [],
+      evidencePackets: [
+        {
+          ...packet("packet-nimbus", "NimbusLedger 默认导出格式是 Arrow IPC", ["NimbusLedger"]),
+          displayLines: ["[answer] NimbusLedger 默认导出格式是 Arrow IPC"],
+          sourceRefs: ["fact:nimbus-export"],
+        },
+      ],
+      renderedBlock: "",
+    },
+    1200,
+  );
+
+  assert.match(context, /NimbusLedger/);
+  assert.match(context, /Arrow IPC/);
+  assert.doesNotMatch(context, /银杏仪表盘/);
 });

@@ -42,6 +42,7 @@ import {
   shouldMaterializePreferenceFact,
   sanitizeWorkflowHint,
 } from "./authority.js";
+import { sourceRefsFromMaintenanceMetadata, uniqueMaintenanceRefs } from "./maintenanceContract.js";
 import { describeStateValue } from "./memoryObjectsHelpers.js";
 import {
   isProjectProfileStateKey,
@@ -542,6 +543,31 @@ function formatFactVectorText(fact: NormalizedFact): string {
     : `${fact.canonicalSubject} ${fact.predicate} ${JSON.stringify(fact.objectValueJson ?? {})}`;
 }
 
+function factVectorSupportMetadata(fact: NormalizedFact): Record<string, unknown> {
+  const sourceRefs = uniqueMaintenanceRefs([
+    ...sourceRefsFromMaintenanceMetadata(fact.objectValueJson),
+    fact.sourceRef,
+  ]);
+  const semanticAssertion = objectRecord(fact.objectValueJson?.semanticAssertion);
+  const supportText =
+    typeof semanticAssertion?.supportText === "string" && semanticAssertion.supportText.trim()
+      ? semanticAssertion.supportText.trim()
+      : typeof fact.objectValueJson?.supportText === "string" && fact.objectValueJson.supportText.trim()
+        ? fact.objectValueJson.supportText.trim()
+        : fact.provenanceText?.trim();
+  return {
+    ...(sourceRefs[0] ? { sourceRef: sourceRefs[0] } : {}),
+    ...(sourceRefs.length > 0
+      ? {
+          sourceRefs,
+          supportRefs: sourceRefs,
+          supportContentRefs: sourceRefs,
+        }
+      : {}),
+    ...(supportText ? { supportText } : {}),
+  };
+}
+
 function buildFact(params: {
   ctx: MemoryOperationContext;
   candidate: ClassifiedCandidate;
@@ -553,6 +579,31 @@ function buildFact(params: {
   sourceRef?: string;
   provenanceText?: string;
 }): NormalizedFact {
+  const sourceRef = params.sourceRef ?? sourceRefForCandidate(params.candidate);
+  const provenanceText = params.provenanceText ?? params.candidate.rawText;
+  const supportRefs = uniqueMaintenanceRefs([
+    ...sourceRefsFromMaintenanceMetadata(params.objectValueJson),
+    sourceRef,
+  ]);
+  const objectValueJson =
+    params.objectValueJson || supportRefs.length > 0 || provenanceText.trim()
+      ? {
+          ...(params.objectValueJson ?? {}),
+          ...(supportRefs[0] ? { sourceRef: supportRefs[0] } : {}),
+          ...(supportRefs.length > 0
+            ? {
+                sourceRefs: supportRefs,
+                supportRefs,
+                supportContentRefs: supportRefs,
+              }
+            : {}),
+          ...(provenanceText.trim() &&
+          typeof params.objectValueJson?.supportText !== "string" &&
+          !objectRecord(params.objectValueJson?.semanticAssertion)?.supportText
+            ? { supportText: truncateText(provenanceText.trim(), 520) }
+            : {}),
+        }
+      : undefined;
   return {
     factId: stableHash([
       params.ctx.agentId,
@@ -564,7 +615,7 @@ function buildFact(params: {
     canonicalSubject: normalizeName(params.subject),
     predicate: params.predicate,
     canonicalObject: params.object ? normalizeName(params.object) : undefined,
-    objectValueJson: params.objectValueJson,
+    objectValueJson,
     scope: params.candidate.scope,
     agentId: params.ctx.agentId,
     confidence: params.confidence ?? params.candidate.confidence,
@@ -572,10 +623,8 @@ function buildFact(params: {
     validFrom: params.candidate.observedAt,
     createdAt: params.candidate.observedAt,
     updatedAt: params.candidate.observedAt,
-    sourceRef:
-      params.sourceRef ??
-      `${params.candidate.source.kind}:${params.candidate.source.messageId ?? params.candidate.source.runId ?? params.candidate.candidateId}`,
-    provenanceText: params.provenanceText ?? params.candidate.rawText,
+    sourceRef,
+    provenanceText,
   };
 }
 
@@ -1566,6 +1615,8 @@ const CANONICAL_ATTRIBUTE_SLOT_ALIASES: Record<string, string> = {
   alert_channel: "alert_channel",
   notificationchannel: "alert_channel",
   notification_channel: "alert_channel",
+  database: "default_database",
+  数据库: "default_database",
   defaultdatabase: "default_database",
   default_database: "default_database",
   defaultdb: "default_database",
@@ -1574,22 +1625,57 @@ const CANONICAL_ATTRIBUTE_SLOT_ALIASES: Record<string, string> = {
   export_format: "export_format",
   outputformat: "export_format",
   output_format: "export_format",
-  messagequeue: "queue",
-  message_queue: "queue",
+  defaultmessagequeue: "default_message_queue",
+  default_message_queue: "default_message_queue",
+  messagequeue: "default_message_queue",
+  message_queue: "default_message_queue",
+  defaultqueue: "default_message_queue",
+  default_queue: "default_message_queue",
   msgqueue: "queue",
   msg_queue: "queue",
-  queue: "queue",
-  cache: "cache",
+  queue: "default_message_queue",
+  消息队列: "default_message_queue",
+  队列: "queue",
+  defaultcache: "default_cache",
+  default_cache: "default_cache",
+  cache: "default_cache",
+  缓存: "default_cache",
   owner: "owner",
   provider: "provider",
   constraint: "constraint",
 };
+const ATTRIBUTE_SLOT_MODIFIER_PREFIXES = new Set([
+  "default",
+  "primary",
+  "main",
+  "current",
+  "selected",
+]);
+const CJK_ATTRIBUTE_SLOT_MODIFIER_PREFIXES = ["默认", "主要", "主", "当前"];
+
+function attributeSlotAlias(slot: string): string | undefined {
+  return CANONICAL_ATTRIBUTE_SLOT_ALIASES[slot] ?? CANONICAL_ATTRIBUTE_SLOT_ALIASES[slot.replace(/_/g, "")];
+}
+
+function stripAttributeSlotModifierPrefix(slot: string): string {
+  const parts = slot.split("_").filter(Boolean);
+  while (parts.length > 1 && ATTRIBUTE_SLOT_MODIFIER_PREFIXES.has(parts[0] ?? "")) {
+    parts.shift();
+  }
+  let stripped = parts.join("_") || slot;
+  for (const prefix of CJK_ATTRIBUTE_SLOT_MODIFIER_PREFIXES) {
+    if (stripped.startsWith(prefix) && stripped.length > prefix.length) {
+      stripped = stripped.slice(prefix.length);
+      break;
+    }
+  }
+  return stripped;
+}
 
 function canonicalAttributeSlot(slot: string): string | undefined {
   const parts = slot.split("_");
   const tail = SEMANTIC_FACT_VERB_PREFIXES.has(parts[0] ?? "") ? parts.slice(1).join("_") : slot;
-  const compactTail = tail.replace(/_/g, "");
-  return CANONICAL_ATTRIBUTE_SLOT_ALIASES[tail] ?? CANONICAL_ATTRIBUTE_SLOT_ALIASES[compactTail];
+  return attributeSlotAlias(tail) ?? attributeSlotAlias(stripAttributeSlotModifierPrefix(tail));
 }
 
 function normalizeSemanticFactPredicate(value: string | undefined): string | undefined {
@@ -1669,7 +1755,6 @@ function shouldMaterializeSemanticAssertionFact(params: {
     params.preference ||
     params.decision ||
     params.correction ||
-    params.relations.length > 0 ||
     params.workflowHints.length > 0 ||
     (params.candidate.structuredHints?.resourceAssertions?.length ?? 0) > 0 ||
     (params.candidate.structuredHints?.adviceSignals?.length ?? 0) > 0
@@ -1755,11 +1840,10 @@ function correctionPredicate(
   correction: MemoryCandidateCorrectionHint,
   assertions: TurnSemanticAssertionDraft[],
 ): string | undefined {
-  return (
-    normalizeSemanticFactPredicate(correction.predicate) ??
-    normalizeSemanticFactPredicate(correction.canonicalKey) ??
-    assertions.flatMap((assertion) => semanticAssertionSlots(assertion))[0]
-  );
+  const canonicalKeyPredicate = normalizeSemanticFactPredicate(correction.canonicalKey);
+  const assertionPredicate = assertions.flatMap((assertion) => semanticAssertionSlots(assertion))[0];
+  const rawPredicate = normalizeSemanticFactPredicate(correction.predicate);
+  return canonicalKeyPredicate ?? assertionPredicate ?? rawPredicate;
 }
 
 // Predicates that represent static structural topology (dependency graphs, ownership, architecture).
@@ -2562,6 +2646,7 @@ export function normalizeCandidate(
           canonicalSubject: fact.canonicalSubject,
           predicate: fact.predicate,
           ...(fact.canonicalObject ? { canonicalObject: fact.canonicalObject } : {}),
+          ...factVectorSupportMetadata(fact),
           ...resourceVectorMetadata(fact.objectValueJson),
           activeHint: true,
           supersededHint: false,

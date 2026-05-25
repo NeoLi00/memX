@@ -112,14 +112,63 @@ test("unfilled stale task instructions are not injected as priority evidence", (
   assert.equal(result.promptEvidence[0].role, "support");
 });
 
+test("low-confidence filled packets are withheld from prompt injection", () => {
+  const query = "青石报表默认导出格式是什么？";
+
+  const result = assembleEvidencePackets({
+    queryAnalysis: queryAnalysis(query),
+    promptEvidence: [
+      chunkCandidate(query, {
+        text: "[answer] RedMapNotebook uses DigestQueue.",
+        rawText: "assistant: RedMapNotebook uses DigestQueue.",
+        sourceRef: "assistant:old",
+        mergedSourceRefs: ["assistant:old"],
+        priority: 0.12,
+        goalScore: 0.18,
+        semanticScore: 0.16,
+        injectionScore: 0.2,
+        slotCoverage: [
+          {
+            slotId: "query_context",
+            requiredHits: ["青石报表"],
+            missingRequired: [],
+            coverageScore: 0.32,
+            filled: true,
+          },
+          {
+            slotId: "answer_value",
+            requiredHits: ["导出格式"],
+            missingRequired: [],
+            coverageScore: 0.34,
+            filled: true,
+          },
+        ],
+        filledSlotIds: ["query_context", "answer_value"],
+      }),
+    ],
+    now: "2026-05-13T00:00:00.000Z",
+  });
+
+  assert.equal(result.packets.length, 1);
+  assert.equal(result.packets[0].coverage.filled, true);
+  assert.equal(result.packets[0].injected, false);
+  assert.equal(result.promptEvidence[0].injected, false);
+  assert.equal(result.promptEvidence[0].role, "support");
+});
+
 test("filled evidence packets are still injected", () => {
   const query = "请检查 notecheck-lab 中文锚点修复是否通过测试";
   const result = assembleEvidencePackets({
     queryAnalysis: queryAnalysis(query),
     promptEvidence: [
       chunkCandidate(query, {
-        text: "[answer] notecheck 中文锚点修复已通过 62 项测试。",
+        text: "notecheck 中文锚点修复已通过 62 项测试。",
         rawText: "assistant: notecheck 中文锚点修复已通过 62 项测试。",
+        priority: 0.7,
+        goalScore: 0.72,
+        semanticScore: 0.74,
+        injectionScore: 0.74,
+        slotEvidenceRole: "answer_value",
         slotCoverage: [
           {
             slotId: "query_context",
@@ -132,7 +181,7 @@ test("filled evidence packets are still injected", () => {
             slotId: "answer_value",
             requiredHits: ["通过 62 项测试"],
             missingRequired: [],
-            coverageScore: 0.9,
+            coverageScore: 0.95,
             filled: true,
           },
         ],
@@ -147,6 +196,163 @@ test("filled evidence packets are still injected", () => {
   assert.equal(result.packets[0].coverage.filled, true);
   assert.equal(result.promptEvidence[0].injected, true);
   assert.equal(result.promptEvidence[0].role, "protected");
+});
+
+test("canonical fact is preferred over raw turn chunk for direct fact answers", () => {
+  const query = "CedarLedger 的默认缓存是什么？";
+  const fact = chunkCandidate(query, {
+    id: "fact:cedar-cache",
+    surface: "fact",
+    text: "CedarLedger has default cache redis",
+    rawText: "CedarLedger has default cache redis",
+    metadata: { recallLayer: "fact" },
+    sourceRef: "user:turn-cedar-cache",
+    mergedSourceRefs: ["user:turn-cedar-cache"],
+    priority: 0.62,
+    goalScore: 0.64,
+    semanticScore: 0.64,
+    injectionScore: 0.64,
+    slotEvidenceRole: "answer_value",
+    slotCoverage: [
+      {
+        slotId: "query_context",
+        requiredHits: ["CedarLedger"],
+        missingRequired: [],
+        coverageScore: 0.78,
+        filled: true,
+      },
+      {
+        slotId: "answer_value",
+        requiredHits: ["默认缓存", "Redis"],
+        missingRequired: [],
+        coverageScore: 0.78,
+        filled: true,
+      },
+    ],
+    filledSlotIds: ["query_context", "answer_value"],
+  });
+  const rawChunk = chunkCandidate(query, {
+    id: "event:chunk:cedar-cache",
+    surface: "chunk",
+    text: "请记住：CedarLedger 的默认缓存是 Redis。",
+    rawText: "user: 请记住：CedarLedger 的默认缓存是 Redis。",
+    metadata: { role: "user" },
+    sourceRef: "user:turn-cedar-cache",
+    mergedSourceRefs: ["user:turn-cedar-cache"],
+    priority: 0.9,
+    goalScore: 0.86,
+    semanticScore: 0.86,
+    injectionScore: 0.86,
+    slotEvidenceRole: "answer_value",
+    slotCoverage: [
+      {
+        slotId: "query_context",
+        requiredHits: ["CedarLedger"],
+        missingRequired: [],
+        coverageScore: 0.86,
+        filled: true,
+      },
+      {
+        slotId: "answer_value",
+        requiredHits: ["默认缓存", "Redis"],
+        missingRequired: [],
+        coverageScore: 0.86,
+        filled: true,
+      },
+    ],
+    filledSlotIds: ["query_context", "answer_value"],
+  });
+
+  const result = assembleEvidencePackets({
+    queryAnalysis: queryAnalysis(query),
+    promptEvidence: [rawChunk, fact],
+    now: "2026-05-13T00:00:00.000Z",
+  });
+
+  const injected = result.packets.find((packet) => packet.injected);
+  assert.ok(injected);
+  assert.equal(injected.answerCandidate.surface, "fact");
+  assert.match(injected.displayLines.join("\n"), /CedarLedger has default cache redis/);
+  assert.doesNotMatch(injected.displayLines.join("\n"), /请记住/);
+});
+
+test("canonical fact can use same-source raw text as hidden support for direct fact answers", () => {
+  const query = "MapleLedger 的默认队列是什么？";
+  const fact = chunkCandidate(query, {
+    id: "fact:maple-queue",
+    surface: "fact",
+    text: "mapleledger has default queue keydb",
+    rawText: "mapleledger has default queue keydb",
+    metadata: { recallLayer: "fact", supportText: "fact_like current MapleLedger KeyDB default_queue" },
+    sourceRef: "user:turn-maple-queue",
+    mergedSourceRefs: ["user:turn-maple-queue"],
+    priority: 0.42,
+    goalScore: 0.4,
+    semanticScore: 0.4,
+    injectionScore: 0.42,
+    slotEvidenceRole: "answer_value",
+    slotCoverage: [
+      {
+        slotId: "query_context",
+        requiredHits: [],
+        missingRequired: ["MapleLedger 默认队列"],
+        coverageScore: 0.34,
+        filled: false,
+      },
+      {
+        slotId: "answer_value",
+        requiredHits: [],
+        missingRequired: ["MapleLedger 默认队列"],
+        coverageScore: 0.38,
+        filled: false,
+      },
+    ],
+    filledSlotIds: [],
+  });
+  const rawChunk = chunkCandidate(query, {
+    id: "event:chunk:maple-queue",
+    surface: "chunk",
+    text: "请记住：MapleLedger 的默认队列是 KeyDB。",
+    rawText: "user: 请记住：MapleLedger 的默认队列是 KeyDB。",
+    metadata: { role: "user" },
+    sourceRef: "user:turn-maple-queue",
+    mergedSourceRefs: ["user:turn-maple-queue"],
+    priority: 0.96,
+    goalScore: 0.9,
+    semanticScore: 0.9,
+    injectionScore: 0.9,
+    slotEvidenceRole: "answer_value",
+    slotCoverage: [
+      {
+        slotId: "query_context",
+        requiredHits: ["MapleLedger 默认队列", query],
+        missingRequired: [],
+        coverageScore: 0.82,
+        filled: true,
+      },
+      {
+        slotId: "answer_value",
+        requiredHits: ["MapleLedger 默认队列", query],
+        missingRequired: [],
+        coverageScore: 0.86,
+        filled: true,
+      },
+    ],
+    filledSlotIds: ["query_context", "answer_value"],
+  });
+
+  const result = assembleEvidencePackets({
+    queryAnalysis: queryAnalysis(query),
+    promptEvidence: [rawChunk, fact],
+    now: "2026-05-13T00:00:00.000Z",
+  });
+
+  const injected = result.packets.find((packet) => packet.injected);
+  assert.ok(injected);
+  assert.equal(injected.answerCandidate.surface, "fact");
+  assert.match(injected.displayLines.join("\n"), /mapleledger has default queue keydb/);
+  assert.doesNotMatch(injected.displayLines.join("\n"), /请记住/);
+  assert.deepEqual(result.packets.filter((packet) => packet.injected), [injected]);
 });
 
 test("task-scoped workflow guidance is excluded from ambient reply guidance", () => {

@@ -16,7 +16,15 @@ type MemxRecallRequest = {
   project?: string;
   hotPathTimeoutMs?: number;
 };
+type MemxAgentRequest = {
+  hostId?: string;
+  actorId?: string;
+  sessionId?: string;
+  workspaceDir?: string;
+  project?: string;
+};
 declare function createServiceConfigFromEnv(env?: NodeJS.ProcessEnv): MemoryPluginConfig;
+declare function formatNativeRecallContext(bundle: EvidenceBundle, maxChars: number): string;
 type NativeContextEligibility = {
   eligible: boolean;
   reason: string;
@@ -39,10 +47,10 @@ declare class MemxHostService {
   recall(request: MemxRecallRequest): Promise<Record<string, unknown>>;
   remember(request: Record<string, unknown>): Promise<Record<string, unknown>>;
   forget(request: Record<string, unknown>): Promise<Record<string, unknown>>;
-  stats(): Promise<Record<string, unknown>>;
-  audit(limit?: number): Promise<Record<string, unknown>>;
+  stats(request?: MemxAgentRequest): Promise<Record<string, unknown>>;
+  audit(limit?: number, request?: MemxAgentRequest): Promise<Record<string, unknown>>;
   context(request: MemxRecallRequest): Promise<Record<string, unknown>>;
 }
 declare function stableHostTurnId(envelope: MemxTurnEnvelope): string;
 //#endregion
-export { MemxHostService, MemxRecallRequest, MemxServiceOptions, assessNativeContextEligibility, createServiceConfigFromEnv, focusRecallBundleForQueryEntities, stableHostTurnId };
+export { MemxAgentRequest, MemxHostService, MemxRecallRequest, MemxServiceOptions, assessNativeContextEligibility, createServiceConfigFromEnv, focusRecallBundleForQueryEntities, formatNativeRecallContext, stableHostTurnId };

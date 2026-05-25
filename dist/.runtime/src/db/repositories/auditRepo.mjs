@@ -141,6 +141,70 @@ var AuditRepo = class {
 		}
 		return this.db.prepare(sql).get(...values)?.createdAt ?? void 0;
 	}
+	listRetrievals(params) {
+		const limit = Math.max(1, Math.min(Math.trunc(params.limit ?? 50), 200));
+		return this.db.prepare(`SELECT audit_id, agent_id, scope, route_type, query_text, query_hash, selected_items_json,
+                injected_chars, created_at
+           FROM retrieval_audit
+          WHERE agent_id = ?
+          ORDER BY created_at DESC, rowid DESC
+          LIMIT ${limit}`).all(params.agentId).map((row) => {
+			const record = row;
+			return {
+				auditId: record.audit_id,
+				agentId: record.agent_id,
+				scope: record.scope,
+				routeType: record.route_type,
+				queryText: record.query_text,
+				queryHash: record.query_hash,
+				selectedItemsJson: safeJsonParse(record.selected_items_json, {}),
+				injectedChars: record.injected_chars,
+				createdAt: record.created_at
+			};
+		});
+	}
+	listPolicyDecisions(params) {
+		const limit = Math.max(1, Math.min(Math.trunc(params.limit ?? 50), 200));
+		return this.db.prepare(`SELECT decision_id, agent_id, source_ref, candidate_hash, salience_score, utility_score,
+                chosen_action, reasons_json, created_at, metadata_json
+           FROM policy_decisions
+          WHERE agent_id = ?
+          ORDER BY created_at DESC, rowid DESC
+          LIMIT ${limit}`).all(params.agentId).map((row) => {
+			const record = row;
+			return {
+				decisionId: record.decision_id,
+				agentId: record.agent_id,
+				sourceRef: record.source_ref,
+				candidateHash: record.candidate_hash,
+				salienceScore: record.salience_score,
+				utilityScore: record.utility_score,
+				chosenAction: record.chosen_action,
+				reasons: safeJsonParse(record.reasons_json, []),
+				metadataJson: safeJsonParse(record.metadata_json, {}),
+				createdAt: record.created_at
+			};
+		});
+	}
+	listMaintenanceRuns(params) {
+		const limit = Math.max(1, Math.min(Math.trunc(params.limit ?? 50), 200));
+		return this.db.prepare(`SELECT run_id, agent_id, job_type, stats_json, started_at, completed_at, status
+           FROM maintenance_runs
+          WHERE agent_id = ?
+          ORDER BY started_at DESC, rowid DESC
+          LIMIT ${limit}`).all(params.agentId).map((row) => {
+			const record = row;
+			return {
+				runId: record.run_id,
+				agentId: record.agent_id,
+				jobType: record.job_type,
+				statsJson: safeJsonParse(record.stats_json, {}),
+				startedAt: record.started_at,
+				completedAt: record.completed_at ?? void 0,
+				status: record.status
+			};
+		});
+	}
 	startMaintenance(params) {
 		const runId = randomId("maintenance");
 		this.db.prepare(`INSERT INTO maintenance_runs(

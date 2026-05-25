@@ -8,6 +8,8 @@ import test from "node:test";
 import { DEFAULT_MEMORY_CONFIG } from "../dist/.runtime/src/config.mjs";
 import { buildOperationContext, MemxRuntimeManager } from "../dist/.runtime/src/runtime.mjs";
 import { runAutomaticMaintenanceBatch } from "../dist/.runtime/src/pipeline/maintenanceBatch.mjs";
+import { compileQueryWithoutSemanticFallback } from "../dist/.runtime/src/pipeline/queryCompiler.mjs";
+import { retrieveEvidence } from "../dist/.runtime/src/pipeline/retrieve.mjs";
 import {
   MEMX_NATIVE_HOOK_TIMEOUT_MS,
   deriveNativeHookHttpTimeoutMs,
@@ -65,6 +67,81 @@ function ctxFor(dbPath) {
       queryHotPathLlmCallCount: 0,
       postAnswerWritebackLlmCallCount: 0,
       maintenanceLlmCallCount: 0,
+    },
+  };
+}
+
+function directFactQueryAnalysis(query, subject, relation) {
+  return {
+    ...compileQueryWithoutSemanticFallback(query),
+    queryEntities: [{ name: subject, type: "project", role: "subject" }],
+    queryShape: {
+      timeframe: "current",
+      granularity: "exact_detail",
+      referentialMode: "anchored",
+      evidenceNeed: "canonical_state",
+    },
+    primaryRoute: "factual",
+    answerGranularity: "detail",
+    evidenceFidelity: "medium",
+    routeWeights: { factual: 0.78, temporal: 0.12, workflow: 0.05, explanatory: 0.05 },
+    anchors: [subject, relation],
+    candidateSurfaces: ["fact", "event", "chunk", "state"],
+    evidenceGoals: [
+      {
+        goal: `Return the current ${relation} value for ${subject}.`,
+        positiveQueries: [query, `${subject} ${relation}`],
+        negativeHints: [],
+        focusAnchors: [subject, relation],
+        preferredSurfaces: ["fact"],
+        fidelity: "medium",
+      },
+    ],
+    evidencePlan: {
+      operation: {
+        type: "return_value",
+        description: "Return the single current attribute value directly supported by memory.",
+      },
+      slots: [
+        {
+          id: "query_context",
+          role: "query_context",
+          requiredRole: "query_context",
+          description: "The entity whose attribute is being requested.",
+          subjectHints: [subject],
+          relationHints: [relation],
+          capabilityQueries: [],
+          negativeHints: [],
+          requiredFields: [subject],
+          preferredLayers: ["fact"],
+          fallbackLayers: ["chunk"],
+          minEvidence: 1,
+        },
+        {
+          id: "answer_value",
+          role: "answer_value",
+          requiredRole: "answer_value",
+          description: "The stored value for the requested attribute.",
+          subjectHints: [subject],
+          relationHints: [relation, relation.replace(/_/g, " ")],
+          capabilityQueries: [],
+          negativeHints: [],
+          requiredFields: ["answer_value"],
+          preferredLayers: ["fact"],
+          fallbackLayers: ["chunk"],
+          minEvidence: 1,
+        },
+      ],
+    },
+    semanticBridges: [],
+    answerMode: "attribute_lookup",
+    supportNeed: 0.42,
+    detailNeedScore: 0.48,
+    ambiguityLevel: 0.05,
+    compilerProvenance: {
+      source: "llm",
+      mode: "semantic-compiler-authoritative",
+      reasons: ["test-direct-fact-query"],
     },
   };
 }
@@ -246,6 +323,530 @@ test("turn scheduler sends the complete user plus assistant turn to the LLM sema
   }
 });
 
+test("assistant-only LLM semantic drafts are materialized without storing the full assistant answer as a fact", async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), "memx-assistant-semantic-"));
+  const dbPath = join(tempDir, "memx.sqlite");
+
+  try {
+    const manager = new MemxRuntimeManager(logger());
+    const ctx = ctxFor(dbPath);
+    const store = await manager.getStore(ctx);
+    store.reasoner.isEnabled = () => true;
+    store.reasoner.summarizeChunk = async (text) => text.slice(0, 120);
+    store.reasoner.compileTurnSemantics = async () => ({
+      sourceRefs: ["user:assistant-semantic:0", "assistant:assistant-semantic:1"],
+      assertionDrafts: [
+        {
+          draftId: "assistant-default-db",
+          sourceRef: "assistant:assistant-semantic:1",
+          familyHint: "fact_like",
+          timeframeHint: "current",
+          entityHints: [
+            { name: "LumenBoard", type: "project" },
+            { name: "PostgreSQL", type: "service" },
+          ],
+          slotHints: ["default_database"],
+          valueHint: "PostgreSQL",
+          confidence: 0.91,
+          lineage: {
+            sourceKind: "chunk",
+            sourceId: "assistant:assistant-semantic:1",
+            sourceRef: "assistant:assistant-semantic:1",
+          },
+        },
+      ],
+      relationDrafts: [
+        {
+          sourceRef: "assistant:assistant-semantic:1",
+          relation: {
+            subject: "LumenBoard",
+            predicate: "uses",
+            relationSlot: "default_database",
+            object: "PostgreSQL",
+            confidence: 0.91,
+          },
+          confidence: 0.91,
+          lineage: {
+            sourceKind: "chunk",
+            sourceId: "assistant:assistant-semantic:1",
+            sourceRef: "assistant:assistant-semantic:1",
+          },
+        },
+      ],
+      compilerProvenance: {
+        source: "llm",
+        mode: "semantic-compiler-authoritative",
+        reasons: ["assistant-semantic-only"],
+      },
+    });
+
+    await store.turnScheduler.enqueue(ctx, [
+      {
+        role: "user",
+        content: "LumenBoard 的默认数据库你建议怎么选？",
+        scope: "agent:main",
+        sessionKey: "s1",
+        turnId: "assistant-semantic",
+        sourceRef: "user:assistant-semantic:0",
+        observedAt,
+      },
+      {
+        role: "assistant",
+        content:
+          "建议把 LumenBoard 的默认数据库定为 PostgreSQL；它适合当前关系型报表需求。",
+        scope: "agent:main",
+        sessionKey: "s1",
+        turnId: "assistant-semantic",
+        sourceRef: "assistant:assistant-semantic:1",
+        observedAt,
+      },
+    ]);
+    await store.turnScheduler.flush();
+
+    const factRows = store.client.prepare("SELECT canonical_object FROM facts").all();
+    assert.ok(
+      factRows.some((row) => String(row.canonical_object).includes("postgresql")),
+      "assistant semantic draft should materialize a reusable structured fact",
+    );
+    assert.ok(
+      Number(store.client.prepare("SELECT COUNT(*) AS count FROM graph_edges").get().count) > 0,
+      "assistant semantic relation draft should materialize a graph edge",
+    );
+    const fullAssistantFact = store.client
+      .prepare("SELECT canonical_object FROM facts WHERE canonical_object LIKE ?")
+      .all("%关系型报表需求%");
+    assert.deepEqual(
+      fullAssistantFact,
+      [],
+      "the full assistant answer should not be copied into fact objects",
+    );
+    await manager.closeAll();
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("direct fact recall injects canonical fact instead of raw source turn wording", async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), "memx-canonical-fact-recall-"));
+  const dbPath = join(tempDir, "memx.sqlite");
+
+  try {
+    const manager = new MemxRuntimeManager(logger());
+    const ctx = ctxFor(dbPath);
+    const store = await manager.getStore(ctx);
+    store.reasoner.isEnabled = () => true;
+    store.reasoner.summarizeChunk = async (text) => text.slice(0, 120);
+    store.reasoner.compileTurnSemantics = async () => ({
+      sourceRefs: ["user:spruce-cache:0", "assistant:spruce-cache:1"],
+      assertionDrafts: [
+        {
+          draftId: "spruce-default-cache",
+          sourceRef: "user:spruce-cache:0",
+          familyHint: "fact_like",
+          timeframeHint: "current",
+          entityHints: [
+            { name: "SpruceLedger", type: "project" },
+            { name: "Dragonfly", type: "service" },
+          ],
+          slotHints: ["default_cache"],
+          valueHint: "Dragonfly",
+          confidence: 0.92,
+          supportSpans: [
+            { sourceRef: "user:spruce-cache:0", text: "请记住：SpruceLedger 的默认缓存是 Dragonfly。" },
+          ],
+          lineage: {
+            sourceKind: "chunk",
+            sourceId: "user:spruce-cache:0",
+            sourceRef: "user:spruce-cache:0",
+          },
+        },
+      ],
+      compilerProvenance: {
+        source: "llm",
+        mode: "semantic-compiler-authoritative",
+        reasons: ["canonical-fact-recall"],
+      },
+    });
+
+    await store.turnScheduler.enqueue(ctx, [
+      {
+        role: "user",
+        content: "请记住：SpruceLedger 的默认缓存是 Dragonfly。",
+        scope: "agent:main",
+        sessionKey: "s1",
+        turnId: "spruce-cache",
+        sourceRef: "user:spruce-cache:0",
+        observedAt,
+      },
+      {
+        role: "assistant",
+        content: "好的，SpruceLedger 的默认缓存按 Dragonfly 处理。",
+        scope: "agent:main",
+        sessionKey: "s1",
+        turnId: "spruce-cache",
+        sourceRef: "assistant:spruce-cache:1",
+        observedAt,
+      },
+    ]);
+    await store.turnScheduler.flush();
+
+    const query = "SpruceLedger 的默认缓存是什么？";
+    const queryAnalysis = directFactQueryAnalysis(query, "SpruceLedger", "default cache");
+    const bundle = await retrieveEvidence(store, ctx, query, query, { queryAnalysis });
+
+    assert.match(bundle.renderedBlock, /spruceledger has default cache dragonfly/i);
+    assert.doesNotMatch(bundle.renderedBlock, /请记住/);
+    assert.doesNotMatch(bundle.renderedBlock, /好的，SpruceLedger 的默认缓存/);
+    assert.equal(bundle.graph.paths.length, 0);
+    await manager.closeAll();
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("current fact recall ignores stale vector docs from superseded fact versions", async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), "memx-current-fact-supersedes-vector-"));
+  const dbPath = join(tempDir, "memx.sqlite");
+
+  try {
+    const manager = new MemxRuntimeManager(logger());
+    const ctx = ctxFor(dbPath);
+    const store = await manager.getStore(ctx);
+    store.reasoner.isEnabled = () => true;
+    store.reasoner.summarizeChunk = async (text) => text.slice(0, 120);
+    let semanticCall = 0;
+    store.reasoner.compileTurnSemantics = async () => {
+      semanticCall += 1;
+      if (semanticCall === 1) {
+        return {
+          sourceRefs: ["user:blueharbor-queue:0", "assistant:blueharbor-queue:1"],
+          assertionDrafts: [
+            {
+              draftId: "blueharbor-queue-nats",
+              sourceRef: "user:blueharbor-queue:0",
+              familyHint: "fact_like",
+              timeframeHint: "current",
+              entityHints: [
+                { name: "BlueHarbor 支付服务", type: "service" },
+                { name: "NATS", type: "service" },
+              ],
+              slotHints: ["default_message_queue"],
+              valueHint: "NATS",
+              confidence: 0.94,
+              supportSpans: [
+                {
+                  sourceRef: "user:blueharbor-queue:0",
+                  text: "BlueHarbor 支付服务的默认消息队列是 NATS。",
+                },
+              ],
+            },
+          ],
+          compilerProvenance: { source: "llm", mode: "semantic-compiler-authoritative" },
+        };
+      }
+      return {
+        sourceRefs: ["user:blueharbor-queue-update:0", "assistant:blueharbor-queue-update:1"],
+        assertionDrafts: [
+          {
+            draftId: "blueharbor-queue-pulsar",
+            sourceRef: "user:blueharbor-queue-update:0",
+            familyHint: "fact_like",
+            timeframeHint: "current",
+            entityHints: [
+              { name: "BlueHarbor 支付服务", type: "service" },
+              { name: "Pulsar", type: "service" },
+            ],
+            slotHints: ["默认消息队列"],
+            valueHint: "Pulsar",
+            confidence: 0.93,
+            supportSpans: [
+              {
+                sourceRef: "user:blueharbor-queue-update:0",
+                text: "之后 BlueHarbor 支付服务默认用 Pulsar。",
+              },
+            ],
+          },
+        ],
+        correctionDrafts: [
+          {
+            sourceRef: "user:blueharbor-queue-update:0",
+            correction: {
+              timeframe: "current",
+              targetKind: "fact",
+              canonicalKey: "BlueHarbor 支付服务.default_message_queue",
+              predicate: "set_default",
+              priorValue: "NATS",
+              nextValue: "Pulsar",
+              confidence: 0.93,
+            },
+            confidence: 0.93,
+          },
+        ],
+        compilerProvenance: { source: "llm", mode: "semantic-compiler-authoritative" },
+      };
+    };
+
+    await store.turnScheduler.enqueue(ctx, [
+      {
+        role: "user",
+        content: "请记住：BlueHarbor 支付服务的默认消息队列是 NATS。",
+        scope: "agent:main",
+        sessionKey: "s1",
+        turnId: "blueharbor-queue",
+        sourceRef: "user:blueharbor-queue:0",
+        observedAt,
+      },
+      {
+        role: "assistant",
+        content: "好的，BlueHarbor 支付服务的默认消息队列先按 NATS 处理。",
+        scope: "agent:main",
+        sessionKey: "s1",
+        turnId: "blueharbor-queue",
+        sourceRef: "assistant:blueharbor-queue:1",
+        observedAt,
+      },
+    ]);
+    await store.turnScheduler.flush();
+    await store.turnScheduler.enqueue(ctx, [
+      {
+        role: "user",
+        content: "这个就不要再考虑了，之后 BlueHarbor 支付服务默认用 Pulsar。",
+        scope: "agent:main",
+        sessionKey: "s1",
+        turnId: "blueharbor-queue-update",
+        sourceRef: "user:blueharbor-queue-update:0",
+        observedAt: "2026-05-21T00:01:00.000Z",
+      },
+      {
+        role: "assistant",
+        content: "明白，BlueHarbor 支付服务之后默认用 Pulsar。",
+        scope: "agent:main",
+        sessionKey: "s1",
+        turnId: "blueharbor-queue-update",
+        sourceRef: "assistant:blueharbor-queue-update:1",
+        observedAt: "2026-05-21T00:01:00.000Z",
+      },
+    ]);
+    await store.turnScheduler.flush();
+
+    const query = "BlueHarbor 支付服务现在默认用什么消息队列？";
+    const queryAnalysis = directFactQueryAnalysis(query, "BlueHarbor 支付服务", "default message queue");
+    const bundle = await retrieveEvidence(store, ctx, query, query, { queryAnalysis });
+
+    assert.match(bundle.renderedBlock, /blueharbor 支付服务 has default message queue pulsar/i);
+    assert.doesNotMatch(bundle.renderedBlock, /nats/i);
+    const degradedBundle = await retrieveEvidence(store, ctx, query, query, {
+      queryAnalysis: compileQueryWithoutSemanticFallback(query),
+    });
+    assert.match(
+      degradedBundle.renderedBlock,
+      /blueharbor 支付服务 has default message queue pulsar/i,
+    );
+    assert.doesNotMatch(degradedBundle.renderedBlock, /nats/i);
+    await manager.closeAll();
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("current fact updates merge bilingual entity descriptors before superseding", async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), "memx-bilingual-entity-supersedes-"));
+  const dbPath = join(tempDir, "memx.sqlite");
+
+  try {
+    const manager = new MemxRuntimeManager(logger());
+    const ctx = ctxFor(dbPath);
+    const store = await manager.getStore(ctx);
+    store.reasoner.isEnabled = () => true;
+    store.reasoner.summarizeChunk = async (text) => text.slice(0, 120);
+    let semanticCall = 0;
+    store.reasoner.compileTurnSemantics = async () => {
+      semanticCall += 1;
+      if (semanticCall === 1) {
+        return {
+          sourceRefs: ["user:blueharbor-bilingual-queue:0", "assistant:blueharbor-bilingual-queue:1"],
+          assertionDrafts: [
+            {
+              draftId: "blueharbor-en-queue-nats",
+              sourceRef: "user:blueharbor-bilingual-queue:0",
+              familyHint: "fact_like",
+              timeframeHint: "current",
+              entityHints: [
+                { name: "BlueHarbor payment service", type: "service" },
+                { name: "NATS", type: "service" },
+              ],
+              slotHints: ["default message queue"],
+              valueHint: "NATS",
+              confidence: 0.94,
+              supportSpans: [
+                {
+                  sourceRef: "user:blueharbor-bilingual-queue:0",
+                  text: "BlueHarbor payment service uses NATS as its default message queue.",
+                },
+              ],
+            },
+          ],
+          compilerProvenance: { source: "llm", mode: "semantic-compiler-authoritative" },
+        };
+      }
+      return {
+        sourceRefs: [
+          "user:blueharbor-bilingual-queue-update:0",
+          "assistant:blueharbor-bilingual-queue-update:1",
+        ],
+        assertionDrafts: [
+          {
+            draftId: "blueharbor-zh-queue-pulsar",
+            sourceRef: "user:blueharbor-bilingual-queue-update:0",
+            familyHint: "fact_like",
+            timeframeHint: "current",
+            entityHints: [
+              { name: "BlueHarbor 支付服务", type: "service" },
+              { name: "Pulsar", type: "service" },
+            ],
+            slotHints: ["默认消息队列"],
+            valueHint: "Pulsar",
+            confidence: 0.93,
+            supportSpans: [
+              {
+                sourceRef: "user:blueharbor-bilingual-queue-update:0",
+                text: "之后 BlueHarbor 支付服务默认用 Pulsar。",
+              },
+            ],
+          },
+        ],
+        correctionDrafts: [
+          {
+            sourceRef: "user:blueharbor-bilingual-queue-update:0",
+            correction: {
+              timeframe: "current",
+              targetKind: "fact",
+              canonicalKey: "BlueHarbor 支付服务.default_message_queue",
+              predicate: "set_default",
+              priorValue: "NATS",
+              nextValue: "Pulsar",
+              confidence: 0.93,
+            },
+            confidence: 0.93,
+          },
+        ],
+        compilerProvenance: { source: "llm", mode: "semantic-compiler-authoritative" },
+      };
+    };
+
+    await store.turnScheduler.enqueue(ctx, [
+      {
+        role: "user",
+        content: "Remember: BlueHarbor payment service uses NATS as its default message queue.",
+        scope: "agent:main",
+        sessionKey: "s1",
+        turnId: "blueharbor-bilingual-queue",
+        sourceRef: "user:blueharbor-bilingual-queue:0",
+        observedAt,
+      },
+      {
+        role: "assistant",
+        content: "Noted. BlueHarbor payment service defaults to NATS for messaging.",
+        scope: "agent:main",
+        sessionKey: "s1",
+        turnId: "blueharbor-bilingual-queue",
+        sourceRef: "assistant:blueharbor-bilingual-queue:1",
+        observedAt,
+      },
+    ]);
+    await store.turnScheduler.flush();
+    await store.turnScheduler.enqueue(ctx, [
+      {
+        role: "user",
+        content: "这个就不要再考虑了，之后 BlueHarbor 支付服务默认用 Pulsar。",
+        scope: "agent:main",
+        sessionKey: "s1",
+        turnId: "blueharbor-bilingual-queue-update",
+        sourceRef: "user:blueharbor-bilingual-queue-update:0",
+        observedAt: "2026-05-21T00:01:00.000Z",
+      },
+      {
+        role: "assistant",
+        content: "明白，后续 BlueHarbor 支付服务默认用 Pulsar。",
+        scope: "agent:main",
+        sessionKey: "s1",
+        turnId: "blueharbor-bilingual-queue-update",
+        sourceRef: "assistant:blueharbor-bilingual-queue-update:1",
+        observedAt: "2026-05-21T00:01:00.000Z",
+      },
+    ]);
+    await store.turnScheduler.flush();
+
+    const activeFacts = store.factRepo
+      .findBySemanticKey({
+        agentId: "main",
+        scope: "agent:main",
+        canonicalSubject: "blueharbor payment service",
+        predicate: "has_default_message_queue",
+      })
+      .filter((fact) => fact.status === "active");
+    assert.equal(activeFacts.length, 1);
+    assert.equal(activeFacts[0].canonicalObject, "pulsar");
+
+    const query = "BlueHarbor 支付服务现在默认用什么消息队列？";
+    const bundle = await retrieveEvidence(store, ctx, query, query, {
+      queryAnalysis: directFactQueryAnalysis(query, "BlueHarbor 支付服务", "default message queue"),
+    });
+
+    assert.match(bundle.renderedBlock, /pulsar/i);
+    assert.doesNotMatch(bundle.renderedBlock, /nats/i);
+    await manager.closeAll();
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("generic active task shells are not indexed for recall", async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), "memx-generic-task-"));
+  const dbPath = join(tempDir, "memx.sqlite");
+
+  try {
+    const manager = new MemxRuntimeManager(logger());
+    const ctx = ctxFor(dbPath);
+    const store = await manager.getStore(ctx);
+    store.reasoner.isEnabled = () => true;
+    store.reasoner.summarizeChunk = async (text) => text.slice(0, 120);
+    store.reasoner.compileTurnSemantics = async () => ({
+      sourceRefs: ["user:generic-task:0"],
+      assertionDrafts: [],
+      correctionDrafts: [],
+      relationDrafts: [],
+      resourceAssertions: [],
+      adviceSignals: [],
+      compilerProvenance: {
+        mode: "llm",
+        reasons: ["empty-semantic-frame"],
+      },
+    });
+
+    await store.turnScheduler.enqueue(ctx, [
+      {
+        role: "user",
+        content: "先看一下这个报表页面有没有明显问题。",
+        scope: "agent:main",
+        sessionKey: "s1",
+        turnId: "generic-task",
+        sourceRef: "user:generic-task:0",
+        observedAt,
+      },
+    ]);
+    await store.turnScheduler.flush();
+
+    const taskVectorDocCount = Number(
+      store.client.prepare("SELECT COUNT(*) AS count FROM vector_docs WHERE doc_id LIKE 'state:task:%'").get()
+        .count,
+    );
+    assert.equal(taskVectorDocCount, 0);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test("host observe stages recallable chunks before the background semantic queue", async () => {
   const tempDir = await mkdtemp(join(tmpdir(), "memx-host-stage-"));
   const dbPath = join(tempDir, "{agentId}", "memx.sqlite");
@@ -353,6 +954,90 @@ test("native context includes staged turn evidence while semantic write is still
     assert.match(result.prependContext, /Arrow IPC/);
     assert.equal(result.recall.diagnostics.includes("pending-staged-turn-evidence"), true);
     service.pendingWrites.clear();
+    await service.close();
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("host audit exposes retrieval, policy, and maintenance records", async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), "memx-host-audit-"));
+  const dbPath = join(tempDir, "{agentId}", "memx.sqlite");
+
+  try {
+    const { MemxHostService } = await import("../dist/.runtime/src/host/service.mjs");
+    const config = configFor(dbPath);
+    config.advanced.enableMaintenanceJobs = false;
+    const service = new MemxHostService({ config, logger: logger() });
+    const ctx = buildOperationContext(config, {
+      agentId: "audit-agent",
+      sessionKey: "s1",
+      workspaceDir: "/tmp/memx-lifecycle-test",
+      project: "audit-test",
+    });
+    const store = await service.manager.getStore(ctx);
+    store.auditRepo.recordRetrieval({
+      auditId: "audit-retrieval-1",
+      agentId: ctx.agentId,
+      scope: "agent:audit-agent",
+      routeType: "mixed",
+      queryText: "AuroraAccept 默认数据库是什么？",
+      queryHash: "query-hash",
+      selectedItemsJson: {
+        nativeContextInjection: {
+          eligible: true,
+          candidateChars: 120,
+          actualInjectedChars: 80,
+        },
+      },
+      injectedChars: 80,
+      createdAt: observedAt,
+    });
+    store.auditRepo.recordPolicyDecision({
+      agentId: ctx.agentId,
+      sourceRef: "user:audit-turn:0",
+      candidateText: "AuroraAccept 默认数据库是 PostgreSQL",
+      decision: {
+        salienceScore: 0.9,
+        expectedFutureUtility: 0.9,
+        sensitivityScore: 0,
+        stabilityScore: 0.9,
+        action: "stable_fact",
+        reasons: ["test-policy"],
+        explicitIntent: false,
+        captureAuthorized: true,
+      },
+      createdAt: observedAt,
+      metadataJson: { materializationOutcome: { facts: 1 } },
+    });
+    const runId = store.auditRepo.startMaintenance({
+      agentId: ctx.agentId,
+      jobType: "batched",
+      stats: { queuedTurns: 3 },
+      startedAt: observedAt,
+    });
+    store.auditRepo.finishMaintenance({
+      runId,
+      agentId: ctx.agentId,
+      jobType: "batched",
+      statsJson: { queuedTurns: 3, promotedFacts: 1 },
+      startedAt: observedAt,
+      completedAt: observedAt,
+      status: "completed",
+    });
+
+    const audit = await service.audit(10, {
+      hostId: "generic",
+      actorId: "audit-agent",
+      sessionId: "s1",
+    });
+
+    assert.equal(audit.retrievals.length, 1);
+    assert.equal(audit.retrievals[0].selectedItemsJson.nativeContextInjection.actualInjectedChars, 80);
+    assert.equal(audit.policyDecisions.length, 1);
+    assert.equal(audit.policyDecisions[0].chosenAction, "stable_fact");
+    assert.equal(audit.maintenanceRuns.length, 1);
+    assert.equal(audit.maintenanceRuns[0].status, "completed");
     await service.close();
   } finally {
     await rm(tempDir, { recursive: true, force: true });

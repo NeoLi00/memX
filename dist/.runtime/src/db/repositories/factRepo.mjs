@@ -1,4 +1,4 @@
-import { safeJsonParse } from "../../support.mjs";
+import { objectRecord, safeJsonParse } from "../../support.mjs";
 import { tokenizeSearchTerms } from "../../pipeline/semantic/heuristics.mjs";
 import "../../pipeline/semantics.mjs";
 //#region src/db/repositories/factRepo.ts
@@ -29,6 +29,30 @@ const SEARCH_STOPWORDS = new Set([
 ]);
 function tokenizeSearch(text) {
 	return tokenizeSearchTerms(text, SEARCH_STOPWORDS);
+}
+function stringArray(value) {
+	return Array.isArray(value) ? value.filter((entry) => typeof entry === "string" && entry.trim().length > 0) : [];
+}
+function uniqueStrings(values) {
+	return [...new Set(values.filter((value) => typeof value === "string" && value.trim().length > 0).map((value) => value.trim()))];
+}
+function sourceRefsFromFactMetadata(metadata) {
+	if (!metadata) return [];
+	const semanticAssertion = objectRecord(metadata.semanticAssertion);
+	return uniqueStrings([
+		typeof metadata.sourceRef === "string" ? metadata.sourceRef : void 0,
+		typeof semanticAssertion?.sourceRef === "string" ? semanticAssertion.sourceRef : void 0,
+		...stringArray(metadata.sourceRefs),
+		...stringArray(metadata.supportRefs),
+		...stringArray(metadata.supportContentRefs)
+	]);
+}
+function supportTextFromFactMetadata(metadata) {
+	if (!metadata) return "";
+	const semanticAssertion = objectRecord(metadata.semanticAssertion);
+	const semanticSupport = typeof semanticAssertion?.supportText === "string" ? semanticAssertion.supportText.trim() : "";
+	if (semanticSupport) return semanticSupport;
+	return typeof metadata.supportText === "string" ? metadata.supportText.trim() : "";
 }
 /**
 * Canonical verb prefixes the LLM policy prompt constrains predicates to.
@@ -268,12 +292,14 @@ var FactRepo = class FactRepo {
 		return Number(result.changes ?? 0);
 	}
 	toFact(row) {
+		const objectValueJson = safeJsonParse(row.object_value_json, void 0);
+		const sourceRefs = sourceRefsFromFactMetadata(objectValueJson);
 		return {
 			factId: row.fact_id,
 			canonicalSubject: row.canonical_subject,
 			predicate: row.predicate,
 			canonicalObject: row.canonical_object ?? void 0,
-			objectValueJson: safeJsonParse(row.object_value_json, void 0),
+			objectValueJson,
 			scope: row.scope,
 			agentId: row.agent_id,
 			confidence: row.confidence,
@@ -283,8 +309,8 @@ var FactRepo = class FactRepo {
 			createdAt: row.created_at,
 			updatedAt: row.updated_at,
 			materializedEpoch: row.materialized_epoch,
-			sourceRef: "",
-			provenanceText: ""
+			sourceRef: sourceRefs[0] ?? "",
+			provenanceText: supportTextFromFactMetadata(objectValueJson)
 		};
 	}
 };

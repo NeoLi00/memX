@@ -5,15 +5,31 @@ import { homedir, platform } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_MEMORY_CONFIG } from "../config.js";
-import { MEMX_NATIVE_HOOK_TIMEOUT_MS, MEMX_NATIVE_HOOK_TIMEOUT_SECONDS } from "../timeouts.js";
+import {
+  deriveNativeHookBudget,
+  MEMX_NATIVE_HOOK_TIMEOUT_MS,
+  MEMX_NATIVE_HOOK_TIMEOUT_SECONDS,
+} from "../timeouts.js";
 import type { MemoryEmbeddingProvider, MemoryLlmProvider, MemoryPluginConfig } from "../types.js";
 import {
   applyClaudeJsonConnect,
+  applyClaudeJsonDisconnect,
   applyCodexTomlConnect,
+  applyCodexTomlDisconnect,
   buildGenericMcpConfig,
   type McpCommandConfig,
   type McpToolsProfile,
 } from "./connect.js";
+import {
+  normalizeStandaloneScopeDefaults,
+  STANDALONE_ALLOWED_SCOPES,
+  STANDALONE_DEFAULT_SCOPE,
+} from "./standaloneConfig.js";
+import {
+  ensureMemxService,
+  type MemxServiceStartOptions,
+  type MemxServiceStatus,
+} from "./serviceManager.js";
 
 const DEFAULT_CONFIG_PATH = join(homedir(), ".memx", "config.json");
 const DEFAULT_DB_PATH = join(homedir(), ".memx", "{agentId}", "memx.sqlite");
@@ -59,6 +75,7 @@ export type StandaloneMemxQuickstartOptions = {
   memxSecret?: string;
   mcpTools?: McpToolsProfile;
   skipEmbeddingDeps?: boolean;
+  skipServiceStart?: boolean;
   dryRun?: boolean;
 };
 
@@ -115,6 +132,7 @@ export type StandaloneQuickstartCommandResult = {
 
 export type StandaloneQuickstartDeps = {
   runCommand?: (command: string, args: string[]) => Promise<StandaloneQuickstartCommandResult>;
+  ensureService?: (options: MemxServiceStartOptions) => Promise<MemxServiceStatus>;
 };
 
 function trimOrUndefined(value: string | undefined): string | undefined {
@@ -279,8 +297,8 @@ function deepMerge<T>(base: T, override: unknown): T {
 function baseStandaloneConfig(): MemoryPluginConfig {
   const config = structuredClone(DEFAULT_MEMORY_CONFIG);
   config.dbPath = DEFAULT_DB_PATH;
-  config.defaultScope = "agent:{agentId}";
-  config.allowedScopes = ["global", "agent:{agentId}", "session:{sessionKey}", "project:{project}"];
+  config.defaultScope = STANDALONE_DEFAULT_SCOPE;
+  config.allowedScopes = [...STANDALONE_ALLOWED_SCOPES];
   config.advanced.llmClassifierEnabled = true;
   config.advanced.enableTurnScheduler = true;
   config.advanced.enableCompatibilityMemoryTools = false;
@@ -292,15 +310,9 @@ export function applyStandaloneMemxQuickstartConfig(
   rawOptions: StandaloneMemxQuickstartOptions,
 ): MemoryPluginConfig {
   const options = normalizeOptions(rawOptions);
-  const next = deepMerge(baseStandaloneConfig(), input);
-  const currentQueryTimeout = next.advanced.queryCompilerHotPathTimeoutMs;
-  if (
-    typeof currentQueryTimeout !== "number" ||
-    currentQueryTimeout < DEFAULT_MEMORY_CONFIG.advanced.queryCompilerHotPathTimeoutMs
-  ) {
-    next.advanced.queryCompilerHotPathTimeoutMs =
-      DEFAULT_MEMORY_CONFIG.advanced.queryCompilerHotPathTimeoutMs;
-  }
+  const next = normalizeStandaloneScopeDefaults(deepMerge(baseStandaloneConfig(), input));
+  next.advanced.queryCompilerHotPathTimeoutMs =
+    DEFAULT_MEMORY_CONFIG.advanced.queryCompilerHotPathTimeoutMs;
   next.advanced.llmProvider = options.llmProvider;
   next.advanced.llmBaseURL = options.llmBaseUrl;
   next.advanced.llmClassifierModel = options.llmModel;
@@ -363,10 +375,11 @@ async function writeHookRuntimeConfig(
   path: string,
   options: NormalizedStandaloneOptions,
 ): Promise<void> {
+  const budget = deriveNativeHookBudget(MEMX_NATIVE_HOOK_TIMEOUT_MS);
   const config = {
     memxUrl: options.memxUrl,
     ...(options.memxSecret ? { memxSecret: options.memxSecret } : {}),
-    hookTimeoutMs: MEMX_NATIVE_HOOK_TIMEOUT_MS,
+    hookTimeoutMs: budget.hookTimeoutMs,
   };
   await writeAtomic(path, `${JSON.stringify(config, null, 2)}\n`);
 }
@@ -418,6 +431,28 @@ async function writeClaudeNativeSettings(options: NormalizedStandaloneOptions): 
   };
   await writeAtomic(path, `${JSON.stringify(next, null, 2)}\n`);
   return { path, backupPath };
+}
+
+async function disconnectCodexMcpConfig(path: string): Promise<string | undefined> {
+  if (!existsSync(path)) {
+    return undefined;
+  }
+  const current = await readFile(path, "utf8");
+  const next = applyCodexTomlDisconnect(current);
+  if (next !== current.trimEnd()) {
+    await writeAtomic(path, next ? `${next}\n` : "");
+  }
+  return path;
+}
+
+async function disconnectClaudeMcpConfig(path: string): Promise<string | undefined> {
+  if (!existsSync(path)) {
+    return undefined;
+  }
+  const current = await readJson(path);
+  const next = applyClaudeJsonDisconnect(current);
+  await writeAtomic(path, `${JSON.stringify(next, null, 2)}\n`);
+  return path;
 }
 
 async function installStandaloneRuntime(runtimeDir: string): Promise<string> {
@@ -878,7 +913,10 @@ async function writeHostConfig(
 ): Promise<Record<string, unknown> | null> {
   if (options.target === "codex") {
     if (codexPlugin && mcpTools === "none") {
-      return { host: "codex", codexPlugin };
+      const path = await disconnectCodexMcpConfig(
+        trimOrUndefined(options.codexConfigPath) ?? join(options.homeDir, ".codex", "config.toml"),
+      );
+      return { host: "codex", path, codexPlugin, mcpTools };
     }
     const path = trimOrUndefined(options.codexConfigPath) ?? join(options.homeDir, ".codex", "config.toml");
     const current = existsSync(path) ? await readFile(path, "utf8") : "";
@@ -896,10 +934,15 @@ async function writeHostConfig(
   }
   if (options.target === "claude-code") {
     if (claudePlugin) {
+      const path = await disconnectClaudeMcpConfig(
+        trimOrUndefined(options.claudeConfigPath) ?? join(options.homeDir, ".claude.json"),
+      );
       const settings = await writeClaudeNativeSettings(options);
       return {
         host: "claude-code",
+        path,
         claudePlugin,
+        mcpTools,
         settingsPath: settings.path,
         settingsBackupPath: settings.backupPath,
       };
@@ -1009,6 +1052,7 @@ export async function runStandaloneMemxQuickstart(
   let hostConfig: Record<string, unknown> | null = null;
   let codexPlugin: Record<string, unknown> | null = null;
   let claudePlugin: Record<string, unknown> | null = null;
+  let service: MemxServiceStatus | null = null;
   if (!options.dryRun) {
     await installStandaloneRuntime(options.runtimeDir);
     await writeAtomic(options.configPath, `${JSON.stringify(next, null, 2)}\n`);
@@ -1038,12 +1082,30 @@ export async function runStandaloneMemxQuickstart(
         );
       }
     }
+    if (!options.skipServiceStart) {
+      const ensureService = deps.ensureService ?? ensureMemxService;
+      service = await ensureService({
+        homeDir: options.homeDir,
+        runtimeDir: options.runtimeDir,
+        configPath: options.configPath,
+        url: options.memxUrl,
+        secret: options.memxSecret,
+      });
+      if (!service.ok) {
+        throw new Error(
+          `standalone quickstart step failed: service-start (${service.error ?? "health check failed"})`,
+        );
+      }
+    }
   }
   return {
     ok: true,
     dryRun: Boolean(options.dryRun),
     ...redactSummary(options, steps, commandConfig, codexPlugin, claudePlugin, mcpTools),
     hostConfig,
-    nextStep: "Start memx-server with this config, then use the configured host.",
+    service,
+    nextStep: service?.ok
+      ? "Use the configured host; memX service is running."
+      : "Run `memx service restart` with this config, then use the configured host.",
   };
 }

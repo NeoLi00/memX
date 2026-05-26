@@ -133,6 +133,28 @@ function localVenvPython(homeDir: string): string {
   return platform() === "win32" ? join(venv, "Scripts", "python.exe") : join(venv, "bin", "python");
 }
 
+const OPENCLAW_SAFE_PACKAGE_FILES = [
+  "dist",
+  "openclaw.plugin.json",
+  "README.md",
+  "README-ch.md",
+  "ARCHITECTURE.md",
+  "ARCHITECTURE-ch.md",
+  "assets",
+];
+
+const OPENCLAW_STANDALONE_PACKAGE_PATHS = [
+  ".agents",
+  ".codex-plugin",
+  ".claude-plugin",
+  ".mcp.json",
+  "hooks.json",
+  "hooks",
+  "skills",
+  "dist/.runtime/src/bin",
+  "dist/.runtime/src/host",
+];
+
 export function resolveCurrentPackageRoot(): string {
   return join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "..");
 }
@@ -156,6 +178,20 @@ async function prepareOpenClawInstallPackage(packageRoot: string): Promise<strin
     }
     await cp(source, join(targetDir, entry), { recursive: true });
   }
+  for (const entry of OPENCLAW_STANDALONE_PACKAGE_PATHS) {
+    await rm(join(targetDir, entry), { recursive: true, force: true });
+  }
+  const sanitizedPackage: Record<string, unknown> = {
+    ...(rawPackage as Record<string, unknown>),
+    files: OPENCLAW_SAFE_PACKAGE_FILES,
+  };
+  delete sanitizedPackage.bin;
+  delete sanitizedPackage.scripts;
+  await writeFile(
+    join(targetDir, "package.json"),
+    `${JSON.stringify(sanitizedPackage, null, 2)}\n`,
+    "utf8",
+  );
   return targetDir;
 }
 

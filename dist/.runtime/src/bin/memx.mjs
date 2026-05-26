@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { homedir } from "node:os";
+import { join } from "node:path";
 //#region src/bin/memx.ts
 function usage() {
 	return [
@@ -6,6 +8,9 @@ function usage() {
 		"",
 		"Commands:",
 		"  server              Start the local memX REST service",
+		"  service status      Report the managed local memX service state",
+		"  service stop        Stop the managed local memX service",
+		"  service restart     Restart the managed local memX service",
 		"  mcp                 Start the memX MCP stdio server",
 		"  hook <host> <event>  Run a native hook bridge",
 		"  quickstart openclaw Configure OpenClaw-only quickstart settings",
@@ -13,8 +18,8 @@ function usage() {
 		"  quickstart claude-code Configure standalone memX for Claude Code",
 		"  quickstart mcp      Configure standalone memX and print generic MCP JSON",
 		"  uninstall openclaw  Cleanly remove memX from OpenClaw config and plugin install",
-		"  uninstall codex     Cleanly remove memX from Codex MCP config",
-		"  uninstall claude-code Cleanly remove memX from Claude Code MCP config",
+		"  uninstall codex     Cleanly remove memX from Codex native hooks, MCP config, and service",
+		"  uninstall claude-code Cleanly remove memX from Claude Code native hooks, MCP config, and service",
 		"  connect codex       Wire Codex MCP config",
 		"  connect claude-code Wire Claude Code MCP config"
 	].join("\n");
@@ -91,6 +96,7 @@ function parseStandaloneQuickstartOptions(target, argv) {
 		memxSecret: readOption(argv, "--memx-secret"),
 		mcpTools: readOption(argv, "--mcp-tools"),
 		skipEmbeddingDeps: hasFlag(argv, "--skip-embedding-deps") || hasFlag(argv, "--no-install-embedding-deps"),
+		skipServiceStart: hasFlag(argv, "--skip-service-start") || hasFlag(argv, "--no-start-service"),
 		dryRun: hasFlag(argv, "--dry-run")
 	};
 }
@@ -101,11 +107,24 @@ function parseUninstallOptions(target, argv) {
 		codexBin: readOption(argv, "--codex-bin"),
 		claudeBin: readOption(argv, "--claude-bin"),
 		homeDir: readOption(argv, "--home"),
+		memxUrl: readOption(argv, "--memx-url"),
+		memxSecret: readOption(argv, "--memx-secret"),
 		codexMarketplaceDir: readOption(argv, "--codex-marketplace-dir"),
 		claudeMarketplaceDir: readOption(argv, "--claude-marketplace-dir"),
 		openclawBin: readOption(argv, "--openclaw-bin"),
 		skipPluginUninstall: hasFlag(argv, "--skip-plugin-uninstall"),
 		dryRun: hasFlag(argv, "--dry-run")
+	};
+}
+function parseServiceOptions(argv) {
+	const homeDir = readOption(argv, "--home") ?? homedir();
+	return {
+		homeDir,
+		url: readOption(argv, "--memx-url"),
+		secret: readOption(argv, "--memx-secret"),
+		runtimeDir: readOption(argv, "--runtime-dir") ?? join(homeDir, ".memx", "runtime"),
+		configPath: readOption(argv, "--config") ?? join(homeDir, ".memx", "config.json"),
+		nodeBin: readOption(argv, "--node")
 	};
 }
 async function main(argv = process.argv.slice(2)) {
@@ -118,6 +137,40 @@ async function main(argv = process.argv.slice(2)) {
 		const { startMemxHttpServer } = await import("../host/httpServer.mjs");
 		await startMemxHttpServer();
 		return;
+	}
+	if (command === "service") {
+		const action = argv[1];
+		const options = parseServiceOptions(argv.slice(2));
+		const { ensureMemxService, readMemxServiceStatus, stopMemxService } = await import("../host/serviceManager.mjs");
+		if (action === "status") {
+			const status = await readMemxServiceStatus(options);
+			console.log(JSON.stringify({
+				target: "service",
+				action,
+				...status
+			}, null, 2));
+			return;
+		}
+		if (action === "stop") {
+			const status = await stopMemxService(options);
+			console.log(JSON.stringify({
+				target: "service",
+				action,
+				...status
+			}, null, 2));
+			return;
+		}
+		if (action === "restart" || action === "start") {
+			const status = await ensureMemxService(options);
+			console.log(JSON.stringify({
+				target: "service",
+				action,
+				...status
+			}, null, 2));
+			if (!status.ok) process.exitCode = 1;
+			return;
+		}
+		throw new Error(`unknown service action: ${action ?? ""}`);
 	}
 	if (command === "mcp") {
 		const { startMcpStdio } = await import("../host/mcpStdio.mjs");

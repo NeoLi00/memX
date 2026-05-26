@@ -1,10 +1,11 @@
+import { MEMX_NATIVE_HOOK_TIMEOUT_MS, deriveNativeHookBudget, deriveNativeHookQueryCompilerTimeoutMs } from "../timeouts.mjs";
 import { normalizeHookPayload } from "./hookPayload.mjs";
-import { MEMX_NATIVE_HOOK_TIMEOUT_MS, deriveNativeHookHttpTimeoutMs, deriveNativeHookQueryCompilerTimeoutMs } from "../timeouts.mjs";
+import { detectNativeMemoryBypass } from "./nativeMemoryBypass.mjs";
 import { completeEnvelopeFromTranscript } from "./transcript.mjs";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 //#region src/host/hookRunner.ts
 const DEFAULT_URL = "http://127.0.0.1:3878";
 const CONTEXT_INJECTION_EVENTS = new Set(["UserPromptSubmit"]);
@@ -45,7 +46,8 @@ async function readHookRuntimeConfig(path) {
 			pendingDir: stringSetting(parsed.pendingDir),
 			hookTimeoutMs: positiveNumberSetting(parsed.hookTimeoutMs),
 			hookContextTimeoutMs: positiveNumberSetting(parsed.hookContextTimeoutMs),
-			hookObserveTimeoutMs: positiveNumberSetting(parsed.hookObserveTimeoutMs)
+			hookObserveTimeoutMs: positiveNumberSetting(parsed.hookObserveTimeoutMs),
+			hookQueryCompilerTimeoutMs: positiveNumberSetting(parsed.hookQueryCompilerTimeoutMs)
 		};
 	} catch (error) {
 		debug(`memx hook config ignored: ${error instanceof Error ? error.message : String(error)}`);
@@ -111,10 +113,29 @@ function recalledContext(response) {
 	const value = response.prependContext ?? response.context;
 	return typeof value === "string" && value.trim() ? value.trim() : null;
 }
+function recallEchoTextsFromContext(context) {
+	const lines = context.split(/\r?\n/u).map((line) => line.trim()).filter(Boolean).filter((line) => !/^#{1,6}\s+/u.test(line)).map((line) => line.replace(/^\s*(?:[-*]|\d+[.)])\s+/u, "").trim()).filter((line) => line.length >= 12);
+	return [...new Set([context.trim(), ...lines])];
+}
+function injectedRecallMetadata(query, response) {
+	const context = recalledContext(response);
+	if (!context) return null;
+	return { memxRecall: {
+		query,
+		injectedTexts: recallEchoTextsFromContext(context)
+	} };
+}
 function writeAdditionalContext(eventName, additionalContext) {
 	process.stdout.write(`${JSON.stringify({ hookSpecificOutput: {
 		hookEventName: eventName,
 		additionalContext
+	} })}\n`);
+}
+function writePreToolUseDeny(eventName, reason) {
+	process.stdout.write(`${JSON.stringify({ hookSpecificOutput: {
+		hookEventName: eventName,
+		permissionDecision: "deny",
+		permissionDecisionReason: reason
 	} })}\n`);
 }
 function parsePositiveInt(value, fallback) {
@@ -143,21 +164,65 @@ async function writePendingTurn(envelope, config) {
 	if (envelope.messages.length === 0) return;
 	const path = pendingPath(envelope, config);
 	await mkdir(pendingRoot(config), { recursive: true });
+	const nextTurns = [...(await readPendingTurns(envelope, config)).filter((pending) => pendingTurnFingerprint(pending) !== pendingTurnFingerprint(envelope)), envelope].slice(-16);
+	const latest = nextTurns.at(-1) ?? envelope;
 	const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
-	await writeFile(tmp, `${JSON.stringify(envelope)}\n`, "utf8");
+	await writeFile(tmp, `${JSON.stringify({
+		...latest,
+		pendingTurns: nextTurns
+	})}\n`, "utf8");
 	await rename(tmp, path);
 }
-async function readPendingTurn(envelope, config) {
+function pendingTurnFingerprint(envelope) {
+	const userText = envelope.messages.filter((message) => message.role === "user").map((message) => message.content.trim()).join("\n");
+	return createHash("sha256").update(JSON.stringify([
+		envelope.hostId,
+		envelope.actorId,
+		envelope.sessionId,
+		envelope.workspaceDir ?? "",
+		envelope.runId ?? "",
+		envelope.observedAt,
+		userText
+	])).digest("hex");
+}
+function validPendingEnvelope(value) {
+	return Boolean(value && typeof value === "object" && Array.isArray(value.messages));
+}
+function writePendingTurns(envelope, turns, config) {
+	const latest = turns.at(-1);
+	if (!latest) return rm(pendingPath(envelope, config), { force: true });
+	const path = pendingPath(envelope, config);
+	const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
+	return writeFile(tmp, `${JSON.stringify({
+		...latest,
+		pendingTurns: turns
+	})}\n`, "utf8").then(() => rename(tmp, path));
+}
+async function readPendingTurns(envelope, config) {
 	try {
 		const parsed = JSON.parse(await readFile(pendingPath(envelope, config), "utf8"));
-		if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.messages)) return null;
-		return parsed;
+		if (parsed && typeof parsed === "object" && Array.isArray(parsed.pendingTurns)) return parsed.pendingTurns.filter(validPendingEnvelope);
+		if (validPendingEnvelope(parsed)) return [parsed];
+		return [];
 	} catch {
-		return null;
+		return [];
 	}
 }
-async function clearPendingTurn(envelope, config) {
-	await rm(pendingPath(envelope, config), { force: true });
+async function clearPendingTurn(envelope, completedPending, config) {
+	const completed = pendingTurnFingerprint(completedPending);
+	await writePendingTurns(envelope, (await readPendingTurns(envelope, config)).filter((pending) => pendingTurnFingerprint(pending) !== completed), config);
+}
+async function annotatePendingTurn(envelope, config, metadata) {
+	const pendingTurns = await readPendingTurns(envelope, config);
+	if (pendingTurns.length === 0) return;
+	const fingerprint = pendingTurnFingerprint(envelope);
+	await writePendingTurns(envelope, pendingTurns.map((pending) => pendingTurnFingerprint(pending) === fingerprint ? {
+		...pending,
+		metadata: {
+			...pending.metadata ?? {},
+			...metadata
+		}
+	} : pending), config);
 }
 function mergePendingTurn(current, pending) {
 	const pendingMessages = pending?.messages ?? [];
@@ -177,6 +242,42 @@ function mergePendingTurn(current, pending) {
 function hasAssistantMessage(envelope) {
 	return envelope.messages.some((message) => message.role === "assistant" && message.content.trim().length > 0);
 }
+function pendingCompletionProbe(current, pending) {
+	return {
+		...pending,
+		eventName: "deferred_flush",
+		observedAt: pending.observedAt,
+		messages: [],
+		metadata: {
+			...pending.metadata ?? {},
+			deferredFlushHookEvent: current.eventName
+		}
+	};
+}
+async function flushCompletedPendingTurns(envelope, config, observeTimeoutMs, transcriptTimeoutMs) {
+	const pendingTurns = await readPendingTurns(envelope, config);
+	for (const pending of pendingTurns) {
+		const observeEnvelope = mergePendingTurn(await completeEnvelopeFromTranscript(pendingCompletionProbe(envelope, pending), pending, { timeoutMs: transcriptTimeoutMs }), pending);
+		if (!hasAssistantMessage(observeEnvelope)) continue;
+		const observeResult = await Promise.resolve().then(() => post("/v1/observe", observeEnvelope, observeTimeoutMs, config)).then(() => ({ status: "fulfilled" }), (reason) => ({
+			status: "rejected",
+			reason
+		}));
+		if (observeResult.status === "fulfilled") await clearPendingTurn(envelope, pending, config);
+		else debug(`memx hook deferred observe failed: ${observeResult.reason instanceof Error ? observeResult.reason.message : String(observeResult.reason)}`);
+	}
+}
+function preservePendingTranscriptMiss(pending, completedEnvelope) {
+	const transcriptPath = completedEnvelope.metadata && typeof completedEnvelope.metadata.transcriptPath === "string" ? completedEnvelope.metadata.transcriptPath : pending.metadata && typeof pending.metadata.transcriptPath === "string" ? pending.metadata.transcriptPath : void 0;
+	return {
+		...pending,
+		metadata: {
+			...pending.metadata ?? {},
+			...transcriptPath ? { transcriptPath } : {},
+			transcriptAssistantCapture: "missing"
+		}
+	};
+}
 function debug(message) {
 	if (process.env["MEMX_HOOK_DEBUG"] === "1") console.error(message);
 }
@@ -184,12 +285,18 @@ async function runMemxHook(argv = process.argv.slice(2)) {
 	const { host, eventName, hookConfigPath } = parseHookArgs(argv);
 	const runtimeConfig = await readHookRuntimeConfig(hookConfigPath);
 	const payload = await readStdinJson();
-	const timeoutMs = runtimePositiveInt(process.env["MEMX_HOOK_TIMEOUT_MS"], runtimeConfig.hookTimeoutMs, MEMX_NATIVE_HOOK_TIMEOUT_MS);
-	const contextTimeoutMs = runtimePositiveInt(process.env["MEMX_HOOK_CONTEXT_TIMEOUT_MS"], runtimeConfig.hookContextTimeoutMs, deriveNativeHookHttpTimeoutMs(timeoutMs));
-	const observeTimeoutMs = runtimePositiveInt(process.env["MEMX_HOOK_OBSERVE_TIMEOUT_MS"], runtimeConfig.hookObserveTimeoutMs, deriveNativeHookHttpTimeoutMs(timeoutMs));
-	const queryCompilerTimeoutMs = deriveNativeHookQueryCompilerTimeoutMs(contextTimeoutMs);
+	const budget = deriveNativeHookBudget(runtimePositiveInt(process.env["MEMX_HOOK_TIMEOUT_MS"], runtimeConfig.hookTimeoutMs, MEMX_NATIVE_HOOK_TIMEOUT_MS));
+	const contextTimeoutMs = runtimePositiveInt(process.env["MEMX_HOOK_CONTEXT_TIMEOUT_MS"], runtimeConfig.hookContextTimeoutMs, budget.contextTimeoutMs);
+	const observeTimeoutMs = runtimePositiveInt(process.env["MEMX_HOOK_OBSERVE_TIMEOUT_MS"], runtimeConfig.hookObserveTimeoutMs, budget.observeTimeoutMs);
+	const queryCompilerTimeoutMs = runtimePositiveInt(process.env["MEMX_HOOK_QUERY_COMPILER_TIMEOUT_MS"] ?? process.env["MEMX_QUERY_COMPILER_TIMEOUT_MS"], runtimeConfig.hookQueryCompilerTimeoutMs, contextTimeoutMs === budget.contextTimeoutMs ? budget.queryCompilerTimeoutMs : deriveNativeHookQueryCompilerTimeoutMs(contextTimeoutMs));
 	try {
 		const envelope = normalizeHookPayload(host, eventName, payload);
+		const bypassDecision = detectNativeMemoryBypass(envelope.hostId, eventName, payload);
+		if (bypassDecision) {
+			writePreToolUseDeny(eventName, bypassDecision.reason);
+			return;
+		}
+		if (eventName === "SessionStart" || hookShouldStorePending(eventName)) await flushCompletedPendingTurns(envelope, runtimeConfig, observeTimeoutMs, 0);
 		if (hookShouldStorePending(eventName)) await writePendingTurn(envelope, runtimeConfig);
 		const contextRequest = hookCanInjectContext(envelope.hostId, eventName) ? contextRequestFromEnvelope(envelope, queryCompilerTimeoutMs) : null;
 		if (contextRequest) {
@@ -202,12 +309,16 @@ async function runMemxHook(argv = process.argv.slice(2)) {
 			}));
 			if (contextResult.status === "fulfilled") {
 				const context = recalledContext(contextResult.value);
-				if (context) writeAdditionalContext(eventName, context);
+				if (context) {
+					const metadata = injectedRecallMetadata(String(contextRequest.query ?? ""), contextResult.value);
+					if (metadata) await annotatePendingTurn(envelope, runtimeConfig, metadata);
+					writeAdditionalContext(eventName, context);
+				}
 			} else debug(`memx hook recall failed: ${contextResult.reason instanceof Error ? contextResult.reason.message : String(contextResult.reason)}`);
 		}
 		if (hookShouldStorePending(eventName)) return;
 		const shouldFlushPending = hookShouldFlushPending(eventName);
-		const pending = shouldFlushPending ? await readPendingTurn(envelope, runtimeConfig) : null;
+		const pending = (shouldFlushPending ? await readPendingTurns(envelope, runtimeConfig) : []).at(-1) ?? null;
 		if (eventName === "SessionEnd" && !pending) {
 			debug("memx hook observe skipped: SessionEnd has no pending user turn");
 			return;
@@ -215,6 +326,7 @@ async function runMemxHook(argv = process.argv.slice(2)) {
 		const completedEnvelope = shouldFlushPending ? await completeEnvelopeFromTranscript(envelope, pending) : envelope;
 		const observeEnvelope = shouldFlushPending ? mergePendingTurn(completedEnvelope, pending) : completedEnvelope;
 		if (shouldFlushPending && pending && !hasAssistantMessage(observeEnvelope)) {
+			await writePendingTurn(preservePendingTranscriptMiss(pending, completedEnvelope), runtimeConfig);
 			debug("memx hook observe deferred: assistant output is not available yet");
 			return;
 		}
@@ -223,7 +335,7 @@ async function runMemxHook(argv = process.argv.slice(2)) {
 			status: "rejected",
 			reason
 		}));
-		if (observeResult.status === "fulfilled" && shouldFlushPending) await clearPendingTurn(envelope, runtimeConfig);
+		if (observeResult.status === "fulfilled" && shouldFlushPending && pending) await clearPendingTurn(envelope, pending, runtimeConfig);
 		if (observeResult.status === "rejected") debug(`memx hook observe failed: ${observeResult.reason instanceof Error ? observeResult.reason.message : String(observeResult.reason)}`);
 	} catch (error) {
 		debug(`memx hook failed: ${error instanceof Error ? error.message : String(error)}`);

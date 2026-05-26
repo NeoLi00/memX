@@ -758,7 +758,11 @@ test("query compiler falls back to a neutral recall plan without deterministic s
   assert.deepEqual(result.anchors, []);
   assert.ok(result.candidateSurfaces.includes("chunk"));
   assert.deepEqual(result.evidenceGoals, []);
-  assert.equal(result.evidencePlan, undefined);
+  assert.equal(result.evidencePlan?.operation.type, "return_value");
+  assert.deepEqual(
+    result.evidencePlan?.slots.flatMap((slot) => slot.requestedAttributeSlots ?? []),
+    [],
+  );
   assert.deepEqual(result.semanticBridges, undefined);
   assert.equal(result.supportNeed, 0);
   assert.ok((result.routeWeights.factual ?? 0) > 0);
@@ -804,7 +808,10 @@ test("query compiler uses LLM semantics when available", async () => {
 
   assert.equal(result.compilerProvenance.source, "llm");
   assert.deepEqual(result.anchors, ["e_p", "sanity check"]);
-  assert.deepEqual(result.candidateSurfaces, ["task", "chunk"]);
+  assert.deepEqual(result.candidateSurfaces.slice(0, 2), ["task", "chunk"]);
+  assert.ok(result.candidateSurfaces.includes("state"));
+  assert.ok(result.candidateSurfaces.includes("event"));
+  assert.ok(result.candidateSurfaces.includes("fact"));
   assert.equal(result.supportNeed, 0.8);
 });
 
@@ -864,6 +871,47 @@ test("query compiler preserves LLM-only suppressed entity constraints for negati
   assert.deepEqual(result.queryEntities, []);
   assert.deepEqual(result.suppressedEntities, [
     { name: "MingLedger", type: "project", reason: "user explicitly excluded this context" },
+  ]);
+});
+
+test("query compiler preserves LLM-only context exclusions for prior-context directives", async () => {
+  const result = await compileQuery({
+    query: "换个话题，别提上一个项目，给我一个轻量级周报模板。",
+    ctx: minimalCtx(),
+    reasoner: {
+      isEnabled: () => true,
+      compileQuerySemantics: async () => ({
+        focusedQuery: "轻量级周报模板",
+        queryEntities: [],
+        suppressedEntities: [],
+        contextExclusions: [
+          {
+            kind: "prior_project",
+            label: "上一个项目",
+            reason: "user explicitly excluded previous project context",
+          },
+          {
+            kind: "random_value",
+            label: "ignored",
+          },
+        ],
+        queryShape: {
+          timeframe: "timeless",
+          granularity: "summary",
+          referentialMode: "anchored",
+          evidenceNeed: "chunk",
+        },
+        primaryRoute: "workflow",
+      }),
+    },
+  });
+
+  assert.deepEqual(result.contextExclusions, [
+    {
+      kind: "prior_project",
+      label: "上一个项目",
+      reason: "user explicitly excluded previous project context",
+    },
   ]);
 });
 
@@ -1532,6 +1580,84 @@ test("normalization canonicalizes multilingual default component slots and persi
       String(fact.objectValueJson?.supportText ?? "").includes("BlueHarbor"),
     ),
   );
+});
+
+test("normalization maps task queue and bare CJK queue slots to the canonical message queue slot", () => {
+  const outputs = normalizeCandidate(
+    {
+      candidateId: "candidate_llm_task_queue_alias",
+      source: {
+        kind: "user",
+        sessionKey: "s1",
+      },
+      observedAt,
+      rawText: "BlueHarbor 支付服务的任务队列默认用 Pulsar。",
+      normalizedText: "blueharbor 支付服务的任务队列默认用 pulsar",
+      eventType: "conversation_turn",
+      structuredHints: {
+        entities: [
+          { name: "BlueHarbor 支付服务", type: "service" },
+          { name: "Pulsar", type: "concept" },
+        ],
+        semanticDraft: {
+          sourceRef: "user:turn-llm-task-queue-alias",
+          assertionDrafts: [
+            {
+              draftId: "draft-llm-task-queue-alias-assertion",
+              sourceRef: "user:turn-llm-task-queue-alias",
+              familyHint: "fact_like",
+              timeframeHint: "current",
+              entityHints: [
+                { name: "BlueHarbor 支付服务", type: "service" },
+                { name: "Pulsar", type: "concept" },
+              ],
+              slotHints: ["default_task_queue", "队列"],
+              valueHint: "Pulsar",
+              confidence: 0.92,
+            },
+          ],
+          correctionDrafts: [],
+          relationDrafts: [],
+          supportSpans: [
+            {
+              sourceRef: "user:turn-llm-task-queue-alias",
+              text: "BlueHarbor 支付服务的任务队列默认用 Pulsar。",
+            },
+          ],
+          compilerProvenance: {
+            source: "llm",
+            mode: "llm",
+          },
+        },
+        materializationHint: {
+          sourceRef: "user:turn-llm-task-queue-alias",
+          primaryFamily: "fact_like",
+          timeframeHint: "current",
+        },
+      },
+      metadata: {
+        sourceRef: "user:turn-llm-task-queue-alias",
+      },
+      classification: "stable-fact",
+      policy: {
+        salienceScore: 0.95,
+        expectedFutureUtility: 0.9,
+        sensitivityScore: 0,
+        stabilityScore: 0.9,
+        action: "stable_fact",
+        reasons: ["semantic-draft-adapter:stable-fact"],
+        explicitIntent: true,
+        captureAuthorized: true,
+      },
+      confidence: 0.92,
+      scope: "agent:main",
+    },
+    minimalCtx(),
+  );
+
+  const predicates = [...new Set(outputs.facts.map((fact) => fact.predicate))];
+  assert.deepEqual(predicates, ["has_default_message_queue"]);
+  assert.ok(outputs.facts.every((fact) => fact.canonicalObject === "pulsar"));
 });
 
 test("reasoner summaries and topic judgments do not rebuild semantics without LLM", async () => {

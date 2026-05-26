@@ -1,7 +1,7 @@
 import { objectRecord, stableHash } from "../support.mjs";
 import { isQuestionLike } from "./semantic/heuristics.mjs";
-import { sanitizeTaskMetadata } from "./authority.mjs";
 import "./semantics.mjs";
+import { sanitizeTaskMetadata } from "./authority.mjs";
 //#region src/pipeline/taskSummary.ts
 function metadataString(value) {
 	return typeof value === "string" && value.trim() ? value.trim() : void 0;

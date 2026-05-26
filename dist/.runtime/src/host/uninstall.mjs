@@ -1,9 +1,10 @@
 import { LEGACY_MEMX_PLUGIN_ID, MEMX_PLUGIN_ID, withoutLegacyPluginIds } from "../identity.mjs";
 import { applyClaudeJsonDisconnect, applyCodexTomlDisconnect } from "./connect.mjs";
-import { existsSync } from "node:fs";
+import { stopMemxService } from "./serviceManager.mjs";
+import { copyFile, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { copyFile, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { spawn } from "node:child_process";
 //#region src/host/uninstall.ts
 const DEFAULT_OPENCLAW_CONFIG_PATH = join(homedir(), ".openclaw", "openclaw.json");
@@ -194,7 +195,13 @@ async function runCodexUninstall(rawOptions = {}, deps = {}) {
 	const next = applyCodexPluginDisconnect(applyCodexTomlDisconnect(current));
 	let backupPath = null;
 	const warnings = [];
+	let service = null;
 	if (!dryRun) {
+		service = await (deps.stopService ?? stopMemxService)({
+			homeDir,
+			url: trimOrUndefined(rawOptions.memxUrl),
+			secret: trimOrUndefined(rawOptions.memxSecret)
+		});
 		backupPath = await backupIfExists(configPath, now);
 		await writeAtomic(configPath, next ? `${next}\n` : "");
 		const runCommand = deps.runCommand ?? defaultRunCommand;
@@ -225,6 +232,7 @@ async function runCodexUninstall(rawOptions = {}, deps = {}) {
 		marketplaceDir,
 		backupPath,
 		warnings,
+		service,
 		removed: current !== next
 	};
 }
@@ -240,7 +248,13 @@ async function runClaudeCodeUninstall(rawOptions = {}, deps = {}) {
 	let backupPath = null;
 	let settingsPath = null;
 	const warnings = [];
+	let service = null;
 	if (!dryRun) {
+		service = await (deps.stopService ?? stopMemxService)({
+			homeDir,
+			url: trimOrUndefined(rawOptions.memxUrl),
+			secret: trimOrUndefined(rawOptions.memxSecret)
+		});
 		backupPath = await backupIfExists(configPath, now);
 		await writeAtomic(configPath, `${JSON.stringify(next, null, 2)}\n`);
 		settingsPath = await restoreClaudeNativeSettings(homeDir);
@@ -281,6 +295,7 @@ async function runClaudeCodeUninstall(rawOptions = {}, deps = {}) {
 		backupPath,
 		settingsPath,
 		warnings,
+		service,
 		removed: Boolean(current?.mcpServers && typeof current.mcpServers === "object" && !Array.isArray(current.mcpServers) && current.mcpServers.memx)
 	};
 }

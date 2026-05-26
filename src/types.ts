@@ -143,6 +143,7 @@ export const MEMORY_CLASSES = [
 export const MEMORY_SOURCE_KINDS = ["user", "assistant", "tool"] as const;
 export const MEMORY_SCOPE_TEMPLATES = [
   "global",
+  "workspace:{workspace}",
   "agent:{agentId}",
   "session:{sessionKey}",
   "project:{project}",
@@ -999,6 +1000,16 @@ export type QuerySuppressedEntityHint = {
   type?: EntityType;
   reason?: string;
 };
+export type QueryContextExclusionKind =
+  | "prior_project"
+  | "prior_topic"
+  | "prior_context"
+  | "host_native_memory";
+export type QueryContextExclusion = {
+  kind: QueryContextExclusionKind;
+  label: string;
+  reason?: string;
+};
 export type CandidateSurface =
   | "state"
   | "fact"
@@ -1047,6 +1058,7 @@ export type QueryEvidenceSlot = {
   description: string;
   subjectHints: string[];
   relationHints?: string[];
+  requestedAttributeSlots?: string[];
   capabilityQueries?: string[];
   negativeHints?: string[];
   requiredFields: string[];
@@ -1113,6 +1125,7 @@ export type QueryCompileResult = {
   focusedQuery: string;
   queryEntities: QueryEntityHint[];
   suppressedEntities: QuerySuppressedEntityHint[];
+  contextExclusions: QueryContextExclusion[];
   queryShape: RecallQueryShape;
   primaryRoute?: MemoryPrimaryRouteType;
   answerGranularity: AnswerGranularity;
@@ -1556,6 +1569,34 @@ export type EvidencePacketAudit = {
     normalizedAllSourceRefs?: NormalizedSourceRef[];
     selectionReason?: string;
   }>;
+  eligibleEvidencePackets?: Array<{
+    packetId: string;
+    injected: boolean;
+    score?: number;
+    finalScore?: number;
+    sourceRefs: string[];
+    allSourceRefs: string[];
+    normalizedSourceRefs?: NormalizedSourceRef[];
+    normalizedAllSourceRefs?: NormalizedSourceRef[];
+    primaryText: string;
+    displayLines?: string[];
+    selectionReason?: string;
+  }>;
+  droppedEvidencePackets?: Array<{
+    packetId: string;
+    score?: number;
+    finalScore?: number;
+    sourceRefs: string[];
+    allSourceRefs: string[];
+    normalizedSourceRefs?: NormalizedSourceRef[];
+    normalizedAllSourceRefs?: NormalizedSourceRef[];
+    primaryText: string;
+    displayLines?: string[];
+    dropReason: string;
+    selectionReason?: string;
+    softPenalties?: string[];
+    hardExclusions?: string[];
+  }>;
   injectedPackets?: string[];
   renderedPromptLines?: Array<{
     lineId: string;
@@ -1990,6 +2031,7 @@ export type TaskAssignmentDecision = {
 export type RetrievalAuditRecord = {
   auditId: string;
   agentId: string;
+  sessionKey?: string;
   scope: string;
   routeType: MemoryRouteType;
   queryText: string;
@@ -2078,11 +2120,32 @@ export type MemoryBeliefRecord = {
 export type MaintenanceRunRecord = {
   runId: string;
   agentId: string;
+  sessionKey?: string;
   jobType: string;
   statsJson: Record<string, unknown>;
   startedAt: string;
   completedAt?: string;
   status: "running" | "completed" | "failed";
+};
+
+export type SemanticWriteJobStatus = "pending" | "running" | "succeeded" | "retrying" | "failed";
+
+export type SemanticWriteJobRecord = {
+  jobId: string;
+  agentId: string;
+  sessionKey: string;
+  scope: string;
+  turnId: string;
+  jobType: "turn_semantic_extraction";
+  sourceRefs: string[];
+  inputHash: string;
+  status: SemanticWriteJobStatus;
+  attemptCount: number;
+  lastError?: string;
+  resultJson: Record<string, unknown>;
+  nextAttemptAt?: string;
+  createdAt: string;
+  updatedAt: string;
 };
 
 export type MaintenanceBatchTriggerReason = "threshold" | "idle" | "shutdown";

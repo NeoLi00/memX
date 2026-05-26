@@ -9,33 +9,64 @@ import {
   type SourceSegmentSemanticExtractionStats,
 } from "./sourceSegmentSemanticExtraction.js";
 
+const SEMANTIC_RETRY_BATCH_LIMIT = 32;
+
+function uniqueTurnIds(turnIds: string[]): string[] {
+  return [...new Set(turnIds.filter((turnId) => turnId.trim().length > 0))];
+}
+
 export async function runAutomaticMaintenanceBatch(
   store: MemxStoreBundle,
   ctx: MemoryOperationContext,
   batch: MaintenanceBatchMetadata,
 ): Promise<void> {
+  const retryJobs = store.auditRepo.listRetryableSemanticWriteJobs({
+    agentId: ctx.agentId,
+    sessionKey: batch.sessionKey,
+    now: ctx.now,
+    limit: SEMANTIC_RETRY_BATCH_LIMIT,
+  });
+  const effectiveCtx: MemoryOperationContext =
+    retryJobs.length > 0
+      ? {
+          ...ctx,
+          scopes: uniqueTurnIds([...ctx.scopes, ...retryJobs.map((job) => job.scope)]),
+        }
+      : ctx;
+  const retryTurnIds = uniqueTurnIds(retryJobs.map((job) => job.turnId));
+  const sourceSegmentTurnIds = uniqueTurnIds([...batch.turnIds, ...retryTurnIds]);
+  const effectiveBatch: MaintenanceBatchMetadata = {
+    ...batch,
+    turnIds: sourceSegmentTurnIds,
+    turnCount: sourceSegmentTurnIds.length,
+  };
   const sourceSegmentStartedAt = nowIso();
   const sourceSegmentRunId = store.auditRepo.startMaintenance({
     agentId: ctx.agentId,
+    sessionKey: batch.sessionKey,
     jobType: "source-segment-semantic-extraction",
     startedAt: sourceSegmentStartedAt,
     stats: {
       sessionKey: batch.sessionKey,
       turnIds: batch.turnIds,
       turnCount: batch.turnCount,
+      repairTurnIds: retryTurnIds,
+      retryJobCount: retryJobs.length,
+      sourceSegmentTurnIds,
       reason: batch.reason,
       status: "started",
     },
   });
   let sourceSegmentStats: SourceSegmentSemanticExtractionStats;
   try {
-    sourceSegmentStats = await runSourceSegmentSemanticExtraction(store, ctx, {
+    sourceSegmentStats = await runSourceSegmentSemanticExtraction(store, effectiveCtx, {
       sessionKey: batch.sessionKey,
-      turnIds: batch.turnIds,
+      turnIds: sourceSegmentTurnIds,
     });
     store.auditRepo.finishMaintenance({
       runId: sourceSegmentRunId,
       agentId: ctx.agentId,
+      sessionKey: batch.sessionKey,
       jobType: "source-segment-semantic-extraction",
       startedAt: sourceSegmentStartedAt,
       completedAt: nowIso(),
@@ -45,6 +76,9 @@ export async function runAutomaticMaintenanceBatch(
         sessionKey: batch.sessionKey,
         turnIds: batch.turnIds,
         turnCount: batch.turnCount,
+        repairTurnIds: retryTurnIds,
+        retryJobCount: retryJobs.length,
+        sourceSegmentTurnIds,
         reason: batch.reason,
       },
     });
@@ -52,6 +86,7 @@ export async function runAutomaticMaintenanceBatch(
     store.auditRepo.finishMaintenance({
       runId: sourceSegmentRunId,
       agentId: ctx.agentId,
+      sessionKey: batch.sessionKey,
       jobType: "source-segment-semantic-extraction",
       startedAt: sourceSegmentStartedAt,
       completedAt: nowIso(),
@@ -60,13 +95,16 @@ export async function runAutomaticMaintenanceBatch(
         sessionKey: batch.sessionKey,
         turnIds: batch.turnIds,
         turnCount: batch.turnCount,
+        repairTurnIds: retryTurnIds,
+        retryJobCount: retryJobs.length,
+        sourceSegmentTurnIds,
         reason: batch.reason,
         error: error instanceof Error ? error.message : String(error),
       },
     });
     throw error;
   }
-  const consolidationStats = await runConsolidation(store, ctx, { batch });
+  const consolidationStats = await runConsolidation(store, effectiveCtx, { batch: effectiveBatch });
   const deltaTriggered =
     sourceSegmentStats.candidatesWritten > 0 ||
     (consolidationStats.batch?.delta.eventsConsidered ?? 0) > 0 ||
@@ -79,13 +117,13 @@ export async function runAutomaticMaintenanceBatch(
     consolidationStats.beliefsUpserted > 0 ||
     consolidationStats.semanticUpgrade.taskSummariesUpgraded > 0;
 
-  const abstractionStats = await runAbstractionJobs(store, ctx, {
+  const abstractionStats = await runAbstractionJobs(store, effectiveCtx, {
     refineWithLlm: false,
-    batch,
+    batch: effectiveBatch,
     deltaTriggered,
   });
-  runAbstractionPromotion(store, ctx, {
-    batch,
+  runAbstractionPromotion(store, effectiveCtx, {
+    batch: effectiveBatch,
     candidateIds: abstractionStats.materializedCandidateIds ?? [],
     deltaTriggered,
   });

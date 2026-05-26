@@ -1,19 +1,42 @@
 import { normalizeName, nowIso, randomId, stableHash, truncateText } from "../support.mjs";
-import { normalizeObservePayload } from "./hookPayload.mjs";
-import { DEFAULT_MEMORY_CONFIG, memxConfigSchema } from "../config.mjs";
+import { attributeSlotContractHints, requestedAttributeSlotsFromText } from "../pipeline/attributeSlots.mjs";
+import { entityNameAliasTerms } from "../pipeline/entityAliases.mjs";
 import { compileQuery } from "../pipeline/queryCompiler.mjs";
+import { lexicalSearchTerms } from "../search/lexical.mjs";
+import { resolveDefaultScope, scopeVarsForContext } from "../security/scopes.mjs";
+import { MemxRuntimeManager, buildOperationContext } from "../runtime.mjs";
+import { DEFAULT_MEMORY_CONFIG, memxConfigSchema } from "../config.mjs";
 import { renderEvidenceBundle, retrieveEvidence } from "../pipeline/retrieve.mjs";
 import { captureAgentEndTurn } from "../pipeline/turnCapture.mjs";
-import { resolveDefaultScope } from "../security/scopes.mjs";
-import { MemxRuntimeManager, buildOperationContext } from "../runtime.mjs";
-import { existsSync, readFileSync } from "node:fs";
+import { normalizeObservePayload } from "./hookPayload.mjs";
+import { STANDALONE_ALLOWED_SCOPES, STANDALONE_DEFAULT_SCOPE, normalizeStandaloneScopeDefaults } from "./standaloneConfig.mjs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
 //#region src/host/service.ts
 const DEFAULT_SERVER_DB_PATH = join(homedir(), ".memx", "{agentId}", "memx.sqlite");
 const DEFAULT_SERVICE_CONFIG_PATH = join(homedir(), ".memx", "config.json");
 function isRecord(value) {
 	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+function stringArray(value) {
+	if (!Array.isArray(value)) return [];
+	return value.filter((entry) => typeof entry === "string" && entry.trim().length > 0);
+}
+function recallEchoTextsFromContext(context) {
+	const lines = context.split(/\r?\n/u).map((line) => line.trim()).filter(Boolean).filter((line) => !/^#{1,6}\s+/u.test(line)).map((line) => line.replace(/^\s*(?:[-*]|\d+[.)])\s+/u, "").trim()).filter((line) => line.length >= 12);
+	return [...new Set([context.trim(), ...lines])];
+}
+function recalledTextsFromMetadata(metadata) {
+	if (!metadata) return [];
+	const direct = stringArray(metadata.recalledTexts);
+	const recall = isRecord(metadata.memxRecall) ? metadata.memxRecall : void 0;
+	const rawTexts = [
+		...direct,
+		...stringArray(recall?.injectedTexts),
+		...typeof recall?.prependContext === "string" && recall.prependContext.trim() ? [recall.prependContext.trim()] : []
+	];
+	return [...new Set(rawTexts.flatMap(recallEchoTextsFromContext))];
 }
 function deepMerge(base, override) {
 	if (!isRecord(base) || !isRecord(override)) return override === void 0 ? base : override;
@@ -24,13 +47,8 @@ function deepMerge(base, override) {
 function serviceDefaultConfig() {
 	const config = structuredClone(DEFAULT_MEMORY_CONFIG);
 	config.dbPath = DEFAULT_SERVER_DB_PATH;
-	config.defaultScope = "agent:{agentId}";
-	config.allowedScopes = [
-		"global",
-		"agent:{agentId}",
-		"session:{sessionKey}",
-		"project:{project}"
-	];
+	config.defaultScope = STANDALONE_DEFAULT_SCOPE;
+	config.allowedScopes = [...STANDALONE_ALLOWED_SCOPES];
 	return config;
 }
 function readServiceConfigFile(path) {
@@ -68,8 +86,7 @@ function loggerOrConsole(logger) {
 }
 function createServiceConfigFromEnv(env = process.env) {
 	const configPath = env["MEMX_CONFIG_PATH"]?.trim() || DEFAULT_SERVICE_CONFIG_PATH;
-	const raw = deepMerge(serviceDefaultConfig(), readServiceConfigFile(configPath));
-	return applyServiceEnvOverrides(memxConfigSchema.parse(raw), env);
+	return applyServiceEnvOverrides(normalizeStandaloneScopeDefaults(memxConfigSchema.parse(deepMerge(serviceDefaultConfig(), readServiceConfigFile(configPath)))), env);
 }
 function hostSessionKey(envelope) {
 	return `${envelope.hostId}:${envelope.sessionId || "default"}`;
@@ -109,6 +126,18 @@ function formatNativeRecallContext(bundle, maxChars) {
 function injectedPackets(bundle) {
 	return bundle.evidencePackets.filter((packet) => packet.injected && !packet.dropReason);
 }
+function finalInjectedPacketAudit(bundle) {
+	return injectedPackets(bundle).map((packet) => ({
+		packetId: packet.packetId,
+		slotId: packet.slotId,
+		role: packet.role,
+		sourceRefs: packet.sourceRefs,
+		score: packet.grade?.finalScore ?? packet.score ?? packet.coverage.confidence,
+		selectionReason: packet.selectionReason,
+		primaryText: truncateText(packet.primaryText, 720),
+		displayLines: (packet.displayLines ?? []).map((line) => truncateText(line, 360))
+	}));
+}
 function bestInjectedPacketScore(packets) {
 	return packets.reduce((best, packet) => Math.max(best, packet.grade?.finalScore ?? packet.score ?? packet.coverage.confidence ?? 0), 0);
 }
@@ -122,7 +151,7 @@ function packetIsStrongNativeContextEvidence(packet) {
 	const contextBinding = packet.grade?.contextBindingScore ?? (packet.coverage.filled ? packet.coverage.confidence : 0);
 	return packetHasSourceGroundedEvidence(packet) && packetHasNativeAnswerSurface(packet) && packet.coverage.missing.length === 0 && score >= .62 && slotCoverage >= .45 && contextBinding >= .42;
 }
-function appendStagedPendingEvidence(bundle, stagedTurns, ctx) {
+function appendStagedPendingEvidence(bundle, stagedTurns, ctx, query, queryAnalysis) {
 	if (stagedTurns.length === 0) return bundle;
 	const stagedRows = stagedTurns.map((turn) => ({
 		id: `pending-staged:${turn.turnId}`,
@@ -137,47 +166,56 @@ function appendStagedPendingEvidence(bundle, stagedTurns, ctx) {
 			sourceId: turn.turnId,
 			sourceRef: `pending-staged:${turn.turnId}`
 		}
-	}));
-	const stagedPackets = stagedRows.map((row) => ({
-		packetId: row.id,
-		slotId: "pending-staged-turn",
-		operationType: "return_value",
-		role: "answer",
-		protected: true,
-		injected: true,
-		layers: ["chunk"],
-		primaryText: row.text,
-		supportingTexts: [],
-		sourceRefs: [row.sourceRef],
-		allSourceRefs: [row.sourceRef],
-		score: row.score,
-		scoreBreakdown: {
-			stagedPendingTurn: true,
-			retrievalScore: row.score
-		},
-		displayLines: [`[answer] ${truncateText(row.text, 360)}`],
-		observedAt: row.observedAt,
-		authorRoles: ["user", "assistant"],
-		coverage: {
-			filled: true,
-			missing: [],
-			confidence: row.confidence
-		},
-		eligibility: {
-			eligible: true,
+	})).filter((row) => stagedPendingTurnCanInject(query, queryAnalysis, row.text));
+	if (stagedRows.length === 0) return {
+		...bundle,
+		diagnostics: [...bundle.diagnostics, "pending-staged-turn-withheld"]
+	};
+	const stagedPackets = stagedRows.map((row) => {
+		const sourceRef = row.sourceRef ?? row.id;
+		const score = row.score ?? .62;
+		const confidence = row.confidence ?? score;
+		return {
+			packetId: row.id,
+			slotId: "pending-staged-turn",
+			operationType: "return_value",
 			role: "answer",
-			blockers: []
-		},
-		grade: {
-			retrievalScore: row.score,
-			answerScore: row.score,
-			contextBindingScore: row.score,
-			slotCoverageScore: row.score,
-			authorityScore: .72,
-			finalScore: row.score
-		},
-		selectionReason: "pending staged turn evidence while semantic write is still queued"
-	}));
+			protected: true,
+			injected: true,
+			layers: ["chunk"],
+			primaryText: row.text,
+			supportingTexts: [],
+			sourceRefs: [sourceRef],
+			allSourceRefs: [sourceRef],
+			score,
+			scoreBreakdown: {
+				stagedPendingTurn: true,
+				retrievalScore: score
+			},
+			displayLines: [`[answer] ${truncateText(row.text, 360)}`],
+			observedAt: row.observedAt,
+			authorRoles: ["user", "assistant"],
+			coverage: {
+				filled: true,
+				missing: [],
+				confidence
+			},
+			eligibility: {
+				eligible: true,
+				role: "answer",
+				blockers: []
+			},
+			grade: {
+				retrievalScore: score,
+				answerScore: score,
+				contextBindingScore: score,
+				slotCoverageScore: score,
+				authorityScore: .72,
+				finalScore: score
+			},
+			selectionReason: "pending staged turn evidence while semantic write is still queued"
+		};
+	});
 	return {
 		...bundle,
 		events: [...stagedRows, ...bundle.events],
@@ -207,16 +245,12 @@ function packetMentionsSuppressedEntity(packet, queryAnalysis) {
 	const normalizedPacketText = normalizeName(packetTextForSuppression(packet));
 	if (!normalizedPacketText) return false;
 	return suppressed.some((entity) => {
-		const normalizedEntity = normalizeName(entity.name);
-		return normalizedEntity.length >= 2 && normalizedPacketText.includes(normalizedEntity);
+		return entityNameAliasTerms(entity.name).some((term) => normalizedPacketText.includes(term));
 	});
 }
 function entityFocusTerms(queryAnalysis) {
 	const terms = /* @__PURE__ */ new Set();
-	for (const entity of queryAnalysis.queryEntities ?? []) {
-		const normalized = normalizeName(entity.name);
-		if (normalized.length >= 2) terms.add(normalized);
-	}
+	for (const entity of queryAnalysis.queryEntities ?? []) for (const term of entityNameAliasTerms(entity.name)) terms.add(term);
 	return [...terms];
 }
 function textMentionsFocusEntity(text, terms) {
@@ -226,6 +260,148 @@ function textMentionsFocusEntity(text, terms) {
 }
 function packetMentionsFocusEntity(packet, terms) {
 	return textMentionsFocusEntity(packetTextForSuppression(packet), terms);
+}
+const QUERY_CONTROL_ANCHOR_STOPWORDS = new Set([
+	"answer",
+	"confirm",
+	"context",
+	"default",
+	"memory",
+	"name",
+	"please",
+	"project",
+	"question",
+	"remember",
+	"reply",
+	"test",
+	"today",
+	"中文",
+	"今天",
+	"先只",
+	"不用",
+	"名字",
+	"只",
+	"回答",
+	"确认",
+	"查看",
+	"简短",
+	"什么",
+	"文件",
+	"现在",
+	"虚构",
+	"记住",
+	"项目"
+]);
+const CODE_LIKE_ANCHOR_RE = /[A-Za-z][A-Za-z0-9_.:-]{2,}|[A-Za-z0-9_.:-]*\d[A-Za-z0-9_.:-]*/g;
+const QUOTED_ANCHOR_RE = /["'`“”‘’「」『』《》]([^"'`“”‘’「」『』《》]{2,80})["'`“”‘’「」『』《》]/gu;
+function hasCjkAnchorText(value) {
+	return /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(value);
+}
+function isDistinctiveAnchorTerm(term) {
+	const normalized = normalizeName(term);
+	if (!normalized || QUERY_CONTROL_ANCHOR_STOPWORDS.has(normalized)) return false;
+	if (hasCjkAnchorText(normalized)) return normalized.length >= 2;
+	if (/[0-9_.:-]/u.test(normalized)) return normalized.length >= 3;
+	return normalized.length >= 4 && !QUERY_CONTROL_ANCHOR_STOPWORDS.has(normalized);
+}
+function addQuotedCjkAnchorNgrams(value, terms) {
+	for (const match of value.matchAll(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]{3,}/gu)) {
+		const run = normalizeName(match[0]);
+		const width = Math.min(4, run.length);
+		for (let index = 0; index <= run.length - width; index += 1) {
+			const gram = run.slice(index, index + width);
+			if (isDistinctiveAnchorTerm(gram)) terms.add(gram);
+		}
+	}
+}
+function queryAnchorTerms(query) {
+	const terms = /* @__PURE__ */ new Set();
+	const add = (value) => {
+		const normalized = normalizeName(value ?? "");
+		if (isDistinctiveAnchorTerm(normalized)) terms.add(normalized);
+	};
+	for (const match of query.matchAll(CODE_LIKE_ANCHOR_RE)) add(match[0]);
+	for (const match of query.matchAll(QUOTED_ANCHOR_RE)) {
+		add(match[1]);
+		addQuotedCjkAnchorNgrams(match[1], terms);
+	}
+	for (const term of lexicalSearchTerms(query, 96)) add(term);
+	return [...terms].slice(0, 24);
+}
+function queryHardAnchorTerms(query) {
+	const terms = /* @__PURE__ */ new Set();
+	for (const match of query.matchAll(CODE_LIKE_ANCHOR_RE)) {
+		const raw = match[0];
+		if (!(/[0-9_.:-]/u.test(raw) || /[a-z][A-Z]/u.test(raw))) continue;
+		const normalized = normalizeName(raw);
+		if (isDistinctiveAnchorTerm(normalized)) terms.add(normalized);
+	}
+	return [...terms].slice(0, 8);
+}
+function requestedAttributeAnchorTerms(query, queryAnalysis) {
+	const slots = /* @__PURE__ */ new Set();
+	for (const requested of requestedAttributeSlotsFromText(query)) slots.add(requested);
+	for (const slot of queryAnalysis.evidencePlan?.slots ?? []) {
+		for (const requested of slot.requestedAttributeSlots ?? []) slots.add(requested);
+		for (const requested of requestedAttributeSlotsFromText(query, slot.description, ...slot.relationHints ?? [], ...slot.requiredFields ?? [])) slots.add(requested);
+	}
+	return attributeSlotContractHints([...slots]).map(normalizeName).filter(isDistinctiveAnchorTerm);
+}
+function queryCompilerIsDegraded(queryAnalysis) {
+	const provenance = queryAnalysis.compilerProvenance;
+	return provenance?.mode === "fallback" || provenance?.source === "deterministic" || (provenance?.reasons ?? []).some((reason) => /timeout|fallback|unavailable|unparsable/iu.test(reason));
+}
+function packetQueryAnchorCoverage(packet, terms) {
+	const text = packetTextForSuppression(packet);
+	let coverage = 0;
+	for (const term of terms) if (textMentionsFocusEntity(text, [term])) coverage += 1;
+	return coverage;
+}
+function packetSatisfiesHardAnchor(packet, terms) {
+	return terms.length === 0 || packetQueryAnchorCoverage(packet, terms) > 0;
+}
+function packetSatisfiesDegradedQueryAnchors(packet, terms, hardTerms = []) {
+	if (!packetSatisfiesHardAnchor(packet, hardTerms)) return false;
+	const requiredCoverage = terms.length >= 2 ? 2 : 1;
+	return packetQueryAnchorCoverage(packet, terms) >= requiredCoverage;
+}
+function compilerAnchorTerms(queryAnalysis) {
+	return [...queryAnalysis.anchors ?? [], ...queryAnalysis.evidenceCoverage?.requiredAnchors ?? []].map(normalizeName).filter(isDistinctiveAnchorTerm);
+}
+function textCoversAnchorTerms(text, terms) {
+	if (terms.length === 0) return false;
+	const requiredCoverage = terms.length >= 2 ? 2 : 1;
+	let coverage = 0;
+	for (const term of terms) if (textMentionsFocusEntity(text, [term])) coverage += 1;
+	return coverage >= requiredCoverage;
+}
+function textCoversAnyAnchorTerm(text, terms) {
+	if (terms.length === 0) return true;
+	return terms.some((term) => textMentionsFocusEntity(text, [term]));
+}
+function stagedPendingTurnCanInject(query, queryAnalysis, text) {
+	const focusTerms = entityFocusTerms(queryAnalysis);
+	if (focusTerms.length > 0) return textMentionsFocusEntity(text, focusTerms);
+	if (textCoversAnchorTerms(text, compilerAnchorTerms(queryAnalysis))) return true;
+	if (queryCompilerIsDegraded(queryAnalysis)) {
+		if (!textCoversAnyAnchorTerm(text, queryHardAnchorTerms(query))) return false;
+		if (queryAnalysis.queryShape?.referentialMode === "deictic" || queryAnalysis.turnMode === "memory_qa" || queryAnalysis.queryShape?.evidenceNeed === "canonical_state") return true;
+		return textCoversAnchorTerms(text, queryAnchorTerms(query));
+	}
+	if (queryAnalysis.queryShape?.referentialMode === "deictic" || queryAnalysis.turnMode === "memory_qa" || queryAnalysis.queryShape?.evidenceNeed === "canonical_state") return true;
+	return false;
+}
+function queryHasContextExclusion(queryAnalysis) {
+	return (queryAnalysis.contextExclusions ?? []).some((exclusion) => exclusion.kind === "prior_project" || exclusion.kind === "prior_topic" || exclusion.kind === "prior_context" || exclusion.kind === "host_native_memory");
+}
+function hasUsableCompilerAnchors(queryAnalysis) {
+	return compilerAnchorTerms(queryAnalysis).length > 0;
+}
+function queryHasPositiveMemoryBinding(queryAnalysis) {
+	if (entityFocusTerms(queryAnalysis).length > 0 || hasUsableCompilerAnchors(queryAnalysis)) return true;
+	if (queryAnalysis.queryShape?.referentialMode === "deictic") return true;
+	if (queryAnalysis.turnMode === "memory_qa") return true;
+	return queryAnalysis.queryShape?.evidenceNeed === "canonical_state";
 }
 function focusEvidenceRows(rows, terms) {
 	return rows.filter((row) => textMentionsFocusEntity(row.text, terms));
@@ -266,7 +442,40 @@ function focusRecallBundleForQueryEntities(queryAnalysis, bundle) {
 		diagnostics: [...bundle.diagnostics, "target-entity-no-focused-evidence"]
 	};
 }
-function assessNativeContextEligibility(_query, queryAnalysis, bundle) {
+function focusRecallBundleForDegradedQueryAnchors(query, queryAnalysis, bundle) {
+	if (!queryCompilerIsDegraded(queryAnalysis) || entityFocusTerms(queryAnalysis).length > 0) return bundle;
+	const terms = queryHardAnchorTerms(query);
+	if (terms.length === 0) return bundle;
+	const focused = {
+		...bundle,
+		states: focusEvidenceRows(bundle.states, terms),
+		tasks: focusEvidenceRows(bundle.tasks, terms),
+		facts: focusEvidenceRows(bundle.facts, terms),
+		events: focusEvidenceRows(bundle.events, terms),
+		alternates: focusEvidenceRows(bundle.alternates, terms),
+		graph: {
+			...bundle.graph,
+			nodes: bundle.graph.nodes.filter((node) => textMentionsFocusEntity(`${node.name} ${node.type}`, terms)),
+			edges: bundle.graph.edges.filter((edge) => textMentionsFocusEntity(JSON.stringify(edge), terms)),
+			pathCandidates: bundle.graph.pathCandidates.filter((candidate) => textMentionsFocusEntity(JSON.stringify(candidate), terms)),
+			paths: bundle.graph.paths.filter((path) => textMentionsFocusEntity(graphPathText(path), terms))
+		},
+		behavioralGuidance: bundle.behavioralGuidance.filter((text) => textMentionsFocusEntity(text, terms)),
+		recalledChunkTexts: bundle.recalledChunkTexts.filter((text) => textMentionsFocusEntity(text, terms)),
+		promptEvidence: bundle.promptEvidence.filter((candidate) => textMentionsFocusEntity([
+			candidate.text,
+			candidate.rawText,
+			candidate.scoringText
+		].filter(Boolean).join("\n"), terms)),
+		evidencePackets: bundle.evidencePackets.filter((packet) => packetSatisfiesHardAnchor(packet, terms)),
+		diagnostics: [...bundle.diagnostics, "degraded-hard-anchor-focused"]
+	};
+	return hasFocusedEvidence(focused) ? focused : {
+		...focused,
+		diagnostics: [...focused.diagnostics, "degraded-hard-anchor-no-focused-evidence"]
+	};
+}
+function assessNativeContextEligibility(query, queryAnalysis, bundle) {
 	const packets = injectedPackets(bundle);
 	if (packets.length === 0) return {
 		eligible: false,
@@ -285,14 +494,46 @@ function assessNativeContextEligibility(_query, queryAnalysis, bundle) {
 		reason: "target-entity-mismatch",
 		bestScore
 	};
-	if (packets.some(packetIsStrongNativeContextEvidence)) return {
-		eligible: true,
-		reason: queryAnalysis.queryEntities.length > 0 ? "llm-query-entities" : "strong-evidence",
+	const positiveMemoryBinding = queryHasPositiveMemoryBinding(queryAnalysis);
+	if (queryHasContextExclusion(queryAnalysis) && !positiveMemoryBinding) return {
+		eligible: false,
+		reason: "excluded-context",
 		bestScore
 	};
-	return {
+	if (!packets.some(packetIsStrongNativeContextEvidence)) return {
 		eligible: false,
 		reason: "weak-evidence",
+		bestScore
+	};
+	const degradedQueryCompiler = queryCompilerIsDegraded(queryAnalysis);
+	if (!degradedQueryCompiler && !positiveMemoryBinding) return {
+		eligible: false,
+		reason: "unbound-context",
+		bestScore
+	};
+	const rawAnchorTerms = focusTerms.length === 0 && degradedQueryCompiler ? [...new Set([...queryAnchorTerms(query), ...requestedAttributeAnchorTerms(query, queryAnalysis)])] : [];
+	if (rawAnchorTerms.length > 0) {
+		const hardAnchorTerms = queryHardAnchorTerms(query);
+		const attributeAnchorTerms = requestedAttributeAnchorTerms(query, queryAnalysis);
+		if (hardAnchorTerms.length > 0 && attributeAnchorTerms.length > 0 && packets.some((packet) => packetSatisfiesHardAnchor(packet, hardAnchorTerms) && packetQueryAnchorCoverage(packet, attributeAnchorTerms) > 0)) return {
+			eligible: true,
+			reason: queryAnalysis.queryEntities.length > 0 ? "llm-query-entities" : "strong-evidence",
+			bestScore
+		};
+		if (Math.max(0, ...packets.map((packet) => packetQueryAnchorCoverage(packet, rawAnchorTerms))) === 0) return {
+			eligible: false,
+			reason: "query-anchor-mismatch",
+			bestScore
+		};
+		if (!packets.some((packet) => packetSatisfiesDegradedQueryAnchors(packet, rawAnchorTerms, hardAnchorTerms))) return {
+			eligible: false,
+			reason: "degraded-query-semantic-mismatch",
+			bestScore
+		};
+	}
+	return {
+		eligible: true,
+		reason: queryAnalysis.queryEntities.length > 0 ? "llm-query-entities" : "strong-evidence",
 		bestScore
 	};
 }
@@ -311,7 +552,9 @@ var MemxHostService = class {
 		await this.manager.closeAll();
 	}
 	pendingWriteKey(ctx) {
-		return `${ctx.agentId}\u0000${ctx.sessionKey ?? "default"}`;
+		const workspace = ctx.workspaceDir?.trim();
+		const scope = workspace ? `workspace:${workspace}` : `session:${ctx.sessionKey ?? "default"}`;
+		return `${ctx.agentId}\u0000${ctx.dbPath}\u0000${scope}`;
 	}
 	hasPendingWrite(ctx) {
 		return this.pendingWrites.has(this.pendingWriteKey(ctx));
@@ -331,7 +574,7 @@ var MemxHostService = class {
 		if (!pending) return 0;
 		const startedAt = performance.now();
 		const configuredBudget = Number.isFinite(hotPathTimeoutMs ?? NaN) ? Math.max(0, Number(hotPathTimeoutMs)) : 0;
-		const timeoutMs = configuredBudget > 0 ? Math.max(0, Math.min(5e3, configuredBudget - 1500)) : 2500;
+		const timeoutMs = configuredBudget > 0 ? Math.max(0, Math.min(250, configuredBudget - 1500)) : 250;
 		if (timeoutMs <= 0) return 0;
 		let timeout;
 		await Promise.race([pending, new Promise((resolve) => {
@@ -344,12 +587,7 @@ var MemxHostService = class {
 		const envelope = normalizeObservePayload(input);
 		const ctx = asEnvelopeContext(this.config, envelope);
 		const store = await this.manager.getStore(ctx);
-		const scope = resolveDefaultScope(this.config, {
-			agentId: ctx.agentId,
-			sessionKey: ctx.sessionKey,
-			project: ctx.project,
-			workspace: ctx.workspaceDir
-		});
+		const scope = resolveDefaultScope(this.config, scopeVarsForContext(ctx));
 		const turnId = randomId("turn");
 		const captured = captureAgentEndTurn({
 			agentId: ctx.agentId,
@@ -357,7 +595,8 @@ var MemxHostService = class {
 			sessionKey: ctx.sessionKey ?? "default",
 			turnId,
 			observedAt: envelope.observedAt || nowIso(),
-			messages: envelope.messages
+			messages: envelope.messages,
+			recalledTexts: recalledTextsFromMetadata(envelope.metadata)
 		});
 		if (captured.length === 0) return {
 			ok: true,
@@ -419,7 +658,8 @@ var MemxHostService = class {
 			reasoner: store.reasoner,
 			hotPathTimeoutMs: remainingHotPathTimeoutMs
 		});
-		const focusedBundle = appendStagedPendingEvidence(focusRecallBundleForQueryEntities(compiled, await retrieveEvidence(store, recallCtx, request.query, compiled.focusedQuery, { queryAnalysis: compiled })), this.hasPendingWrite(ctx) ? this.manager.recentStagedRecallableTurns(ctx, 4) : [], ctx);
+		const bundle = await retrieveEvidence(store, recallCtx, request.query, compiled.focusedQuery, { queryAnalysis: compiled });
+		const focusedBundle = appendStagedPendingEvidence(focusRecallBundleForDegradedQueryAnchors(request.query, compiled, focusRecallBundleForQueryEntities(compiled, bundle)), this.hasPendingWrite(ctx) ? this.manager.recentStagedRecallableTurns(ctx, 4) : [], ctx, request.query, compiled);
 		const limit = Math.max(1, Math.min(Math.trunc(request.limit ?? 6), 24));
 		const contextEligibility = assessNativeContextEligibility(request.query, compiled, focusedBundle);
 		const graphPaths = Array.isArray(focusedBundle.graph?.paths) ? focusedBundle.graph.paths : [];
@@ -439,7 +679,11 @@ var MemxHostService = class {
 				paths: graphPaths.slice(0, Math.min(limit, 6)),
 				edges: graphEdges.slice(0, Math.min(limit, 12))
 			},
-			diagnostics: focusedBundle.diagnostics
+			diagnostics: focusedBundle.diagnostics,
+			audit: {
+				finalInjectedPackets: finalInjectedPacketAudit(focusedBundle),
+				finalDiagnostics: focusedBundle.diagnostics
+			}
 		};
 	}
 	async remember(request) {
@@ -542,20 +786,30 @@ var MemxHostService = class {
 			scopes: ctx.scopes,
 			signals: store.auditRepo.listSignals({
 				agentId: ctx.agentId,
+				sessionKey: ctx.sessionKey,
 				limit: boundedLimit
 			}),
 			retrievals: store.auditRepo.listRetrievals({
 				agentId: ctx.agentId,
+				sessionKey: ctx.sessionKey,
 				limit: boundedLimit
 			}),
 			policyDecisions: store.auditRepo.listPolicyDecisions({
 				agentId: ctx.agentId,
+				sessionKey: ctx.sessionKey,
 				limit: boundedLimit
 			}),
 			maintenanceRuns: store.auditRepo.listMaintenanceRuns({
 				agentId: ctx.agentId,
+				sessionKey: ctx.sessionKey,
 				limit: boundedLimit
-			})
+			}),
+			semanticWriteJobs: store.auditRepo.listSemanticWriteJobs({
+				agentId: ctx.agentId,
+				sessionKey: ctx.sessionKey,
+				limit: boundedLimit
+			}),
+			maintenanceSchedulerStates: store.maintenanceRepo.listPendingStates().filter((state) => state.agentId === ctx.agentId && state.sessionKey === ctx.sessionKey).slice(0, boundedLimit)
 		};
 	}
 	async context(request) {
@@ -580,11 +834,18 @@ var MemxHostService = class {
 			};
 			const ctx = asEnvelopeContext(this.config, envelope);
 			const store = await this.manager.getStore(ctx);
+			const auditPayload = isRecord(recalled.audit) ? recalled.audit : {};
+			const finalInjectedPackets = Array.isArray(auditPayload.finalInjectedPackets) ? auditPayload.finalInjectedPackets : [];
+			const finalDiagnostics = Array.isArray(auditPayload.finalDiagnostics) ? auditPayload.finalDiagnostics.filter((entry) => typeof entry === "string") : void 0;
 			store.auditRepo.annotateLatestRetrievalInjection({
 				agentId: ctx.agentId,
+				sessionKey: ctx.sessionKey,
 				queryText: request.query,
 				candidateChars: candidateContext.length,
 				actualInjectedChars: prependContext.length,
+				actualContextPreview: truncateText(prependContext, 1600),
+				finalInjectedPackets: prependContext ? finalInjectedPackets : [],
+				finalDiagnostics,
 				eligible: eligibility?.eligible ?? true,
 				reason: eligibility?.reason,
 				finalizedAt: ctx.now
@@ -637,4 +898,4 @@ function stableHostTurnId(envelope) {
 	]);
 }
 //#endregion
-export { MemxHostService, assessNativeContextEligibility, createServiceConfigFromEnv, focusRecallBundleForQueryEntities, formatNativeRecallContext, stableHostTurnId };
+export { MemxHostService, assessNativeContextEligibility, createServiceConfigFromEnv, focusRecallBundleForDegradedQueryAnchors, focusRecallBundleForQueryEntities, formatNativeRecallContext, stableHostTurnId };

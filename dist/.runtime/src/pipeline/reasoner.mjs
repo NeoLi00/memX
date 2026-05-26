@@ -1,13 +1,14 @@
 import { clamp01, isValidEntityName, normalizeText, truncateText } from "../support.mjs";
-import { recordMemoryLlmBudgetCall } from "./llmBudgetAudit.mjs";
-import { buildQueryCompilerPromptInput } from "./queryCompiler.mjs";
 import { canonicalStateKey, normalizeGraphRelationType } from "./semantic/heuristics.mjs";
-import { sanitizeTaskMetadata } from "./authority.mjs";
 import { basicSemanticSimilarity } from "./semantic/textSimilarity.mjs";
+import { recordMemoryLlmBudgetCall } from "./llmBudgetAudit.mjs";
 import { canonicalizePreferencePredicate } from "./semantics.mjs";
 import { assessAssistantChunk, renderTaskPromptChunk } from "./sourceWeighting.mjs";
-import { buildTurnSemanticCompilerInput } from "./turnSemanticCompiler.mjs";
+import { sanitizeTaskMetadata } from "./authority.mjs";
+import { canonicalAttributeSlot } from "./attributeSlots.mjs";
 import { loadJudgeModelConfig } from "./judgeModelConfig.mjs";
+import { buildQueryCompilerPromptInput } from "./queryCompiler.mjs";
+import { buildTurnSemanticCompilerInput } from "./turnSemanticCompiler.mjs";
 //#region src/pipeline/reasoner.ts
 function shouldRetrySemanticCompile(options) {
 	return (options.stage === "post_answer_writeback" || options.stage === "maintenance_async") && !options.signal?.aborted;
@@ -574,11 +575,12 @@ function buildQueryCompilePrompt(query, fallback) {
 	return {
 		system: [
 			"把用户最新请求编译成轻量记忆检索计划；只输出严格 JSON。",
-			"顶层字段只能是：focusedQuery、queryEntities、suppressedEntities、queryShape、primaryRoute。",
-			"返回格式：{\"focusedQuery\": string, \"queryEntities\": [{\"name\": string, \"type\"?: \"person\"|\"project\"|\"tool\"|\"service\"|\"language\"|\"framework\"|\"concept\"|\"organization\"|\"unknown\", \"role\"?: \"subject\"|\"object\"|\"context\"|\"resource\"}], \"suppressedEntities\"?: [{\"name\": string, \"type\"?: \"person\"|\"project\"|\"tool\"|\"service\"|\"language\"|\"framework\"|\"concept\"|\"organization\"|\"unknown\", \"reason\"?: string}], \"queryShape\": {\"timeframe\": \"current\"|\"historical\"|\"compare\"|\"timeless\", \"granularity\": \"summary\"|\"exact_detail\", \"referentialMode\": \"anchored\"|\"deictic\", \"evidenceNeed\": \"workflow_context\"|\"canonical_state\"|\"factual_history\"|\"event_history\"|\"relation\"|\"chunk\"}, \"primaryRoute\": \"workflow\"|\"factual\"|\"temporal\"|\"explanatory\"}。",
+			"顶层字段只能是：focusedQuery、queryEntities、suppressedEntities、contextExclusions、queryShape、primaryRoute。",
+			"返回格式：{\"focusedQuery\": string, \"queryEntities\": [{\"name\": string, \"type\"?: \"person\"|\"project\"|\"tool\"|\"service\"|\"language\"|\"framework\"|\"concept\"|\"organization\"|\"unknown\", \"role\"?: \"subject\"|\"object\"|\"context\"|\"resource\"}], \"suppressedEntities\"?: [{\"name\": string, \"type\"?: \"person\"|\"project\"|\"tool\"|\"service\"|\"language\"|\"framework\"|\"concept\"|\"organization\"|\"unknown\", \"reason\"?: string}], \"contextExclusions\"?: [{\"kind\": \"prior_project\"|\"prior_topic\"|\"prior_context\"|\"host_native_memory\", \"label\": string, \"reason\"?: string}], \"queryShape\": {\"timeframe\": \"current\"|\"historical\"|\"compare\"|\"timeless\", \"granularity\": \"summary\"|\"exact_detail\", \"referentialMode\": \"anchored\"|\"deictic\", \"evidenceNeed\": \"workflow_context\"|\"canonical_state\"|\"factual_history\"|\"event_history\"|\"relation\"|\"chunk\"}, \"primaryRoute\": \"workflow\"|\"factual\"|\"temporal\"|\"explanatory\"}。",
 			"focusedQuery 最长 160 字，只压缩当前请求，不加入不存在的事实。",
 			"queryEntities 只输出稳定具名实体，如项目、工具、服务、框架、语言、人、组织；不要输出代词、泛指词、数学变量、完整句子或学科名。",
 			"suppressedEntities 只在用户明确说不谈、不考虑、排除某个具名实体或主题时输出；它表示这些实体不应触发 native context 注入，不是 recall 开关。",
+			"contextExclusions 只在用户明确要求不要使用或不要提及旧项目、旧话题、历史上下文、宿主原生记忆时输出；它是下游过滤约束，不是 recall 开关。",
 			"primaryRoute：workflow=任务/状态，factual=稳定事实/配置，temporal=过去事件，explanatory=原因/关系。",
 			"是否有可用记忆由检索和过滤决定；不要输出 no-recall/skip/shouldRecall/use/avoid 等字段。",
 			"只根据 visibleQuery 生成计划；不要根据 omittedChars 臆测。"
@@ -697,12 +699,9 @@ function buildCompactLongTurnSemanticPrompt(input, fallback) {
 }
 function compactSlot(value) {
 	if (typeof value !== "string") return;
-	const slot = normalizeText(value.replace(/([a-z0-9])([A-Z])/g, "$1_$2")).replace(/[^\p{L}\p{N}]+/gu, "_").replace(/^_+|_+$/g, "");
-	return {
-		alertchannel: "alert_channel",
-		defaultdatabase: "default_database",
-		exportformat: "export_format"
-	}[slot] ?? (slot || void 0);
+	const canonical = canonicalAttributeSlot(value);
+	if (canonical) return canonical;
+	return normalizeText(value.replace(/([a-z0-9])([A-Z])/g, "$1_$2")).replace(/[^\p{L}\p{N}]+/gu, "_").replace(/^_+|_+$/g, "") || void 0;
 }
 function compactConfidence(value, fallback) {
 	return typeof value === "number" && Number.isFinite(value) ? clamp01(value) : fallback;

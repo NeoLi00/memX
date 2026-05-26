@@ -7,6 +7,9 @@ export type AssistantChunkAssessment = {
   grounding: number;
   complexity: number;
   useSummaryOnly: boolean;
+  semanticRole?: "assistant_acknowledgement";
+  memoryClass?: "assistant_acknowledgement";
+  recallVisibility?: "support_only";
 };
 
 export function contentStructuralComplexity(text: string): number {
@@ -56,6 +59,40 @@ function nearestToolDistance(chunks: ConversationChunk[], index: number): number
   return bestDistance;
 }
 
+const ASSISTANT_ACK_CUE_RE =
+  /(?:\b(?:acknowledged|got it|noted|recorded|saved|remembered|understood)\b|\b(?:i(?:'ll| will| have|’ll) (?:remember|record|save|keep|use|treat)|going forward|from now on)\b|(?:已(?:记住|记下|记录|保存)|(?:记住|记下|记录|保存)(?:了)?|收到|好的|明白|了解|后续(?:我)?会|以后(?:我)?会|我会(?:记得|按|用|照)))/iu;
+
+function looksLikeAssistantAcknowledgement(
+  chunk: ConversationChunk,
+  taskChunks: ConversationChunk[],
+  assessment: Pick<AssistantChunkAssessment, "grounding" | "complexity">,
+): boolean {
+  const trimmed = chunk.content.trim();
+  if (!trimmed || chunk.role !== "assistant") {
+    return false;
+  }
+  const lineCount = trimmed.split(/\r?\n/u).length;
+  if (trimmed.length > 560 || lineCount > 6 || trimmed.includes("```")) {
+    return false;
+  }
+  if (!ASSISTANT_ACK_CUE_RE.test(trimmed)) {
+    return false;
+  }
+  const index = taskChunks.findIndex((entry) => entry.chunkId === chunk.chunkId);
+  const supportText = index >= 0 ? surroundingSupportText(taskChunks, index) : "";
+  const echoScore = supportText
+    ? Math.max(
+        semanticTextSimilarity(trimmed, supportText),
+        semanticTextSimilarity(chunk.summary || trimmed, supportText),
+      )
+    : assessment.grounding;
+  const strongMemoryAck =
+    /\b(?:remember|record|save|noted|saved|recorded|remembered)\b|(?:记住|记下|记录|保存)/iu.test(
+      trimmed,
+    );
+  return strongMemoryAck ? echoScore >= 0.18 || supportText.length === 0 : echoScore >= 0.42;
+}
+
 export function assessAssistantChunk(
   chunk: ConversationChunk,
   taskChunks: ConversationChunk[],
@@ -95,11 +132,22 @@ export function assessAssistantChunk(
       complexity * 0.28 -
       longTutorialPenalty,
   );
-  return {
-    weight,
+  const acknowledgement = looksLikeAssistantAcknowledgement(chunk, taskChunks, {
     grounding,
     complexity,
-    useSummaryOnly: weight < 0.58 || complexity > 0.68,
+  });
+  return {
+    weight: acknowledgement ? Math.min(weight, 0.34) : weight,
+    grounding,
+    complexity,
+    useSummaryOnly: acknowledgement || weight < 0.58 || complexity > 0.68,
+    ...(acknowledgement
+      ? {
+          semanticRole: "assistant_acknowledgement" as const,
+          memoryClass: "assistant_acknowledgement" as const,
+          recallVisibility: "support_only" as const,
+        }
+      : {}),
   };
 }
 

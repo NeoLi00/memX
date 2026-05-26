@@ -234,7 +234,14 @@ async function discoverTranscriptPath(hostId: MemxHostId, sessionId: string): Pr
     .flat()
     .sort((left, right) => right.mtimeMs - left.mtimeMs)
     .slice(0, MAX_DISCOVERY_FILES);
-  return files.find((entry) => basename(entry.path).includes(sessionId))?.path ?? files[0]?.path;
+  const exactSessionMatch = files.find((entry) => basename(entry.path).includes(sessionId))?.path;
+  if (exactSessionMatch) {
+    return exactSessionMatch;
+  }
+  if (process.env["MEMX_TRANSCRIPT_DISCOVERY_FALLBACK"] === "1") {
+    return files[0]?.path;
+  }
+  return undefined;
 }
 
 export async function extractAssistantFromTranscript(params: {
@@ -289,6 +296,7 @@ export async function extractAssistantFromTranscript(params: {
 export async function completeEnvelopeFromTranscript(
   envelope: MemxTurnEnvelope,
   pending?: MemxTurnEnvelope | null,
+  options: { timeoutMs?: number; intervalMs?: number } = {},
 ): Promise<MemxTurnEnvelope> {
   if (envelope.messages.some((message) => message.role === "assistant" && message.content.trim())) {
     return envelope;
@@ -299,13 +307,19 @@ export async function completeEnvelopeFromTranscript(
   const transcriptPath =
     envelope.metadata && typeof envelope.metadata.transcriptPath === "string"
       ? envelope.metadata.transcriptPath
+      : pending?.metadata && typeof pending.metadata.transcriptPath === "string"
+        ? pending.metadata.transcriptPath
       : undefined;
   const timeoutMs = parsePositiveInt(
-    process.env["MEMX_TRANSCRIPT_CAPTURE_TIMEOUT_MS"],
+    options.timeoutMs !== undefined
+      ? String(options.timeoutMs)
+      : process.env["MEMX_TRANSCRIPT_CAPTURE_TIMEOUT_MS"],
     MEMX_TRANSCRIPT_CAPTURE_TIMEOUT_MS,
   );
   const intervalMs = parsePositiveInt(
-    process.env["MEMX_TRANSCRIPT_CAPTURE_INTERVAL_MS"],
+    options.intervalMs !== undefined
+      ? String(options.intervalMs)
+      : process.env["MEMX_TRANSCRIPT_CAPTURE_INTERVAL_MS"],
     MEMX_TRANSCRIPT_CAPTURE_INTERVAL_MS,
   );
   const startedAt = Date.now();

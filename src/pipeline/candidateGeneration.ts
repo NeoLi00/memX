@@ -373,7 +373,16 @@ function deriveSurfaceBudgets(
   const fidelityBoost = compiled.evidenceFidelity === "high" ? 1 : 0;
   const supportBoost = compiled.supportNeed >= 0.72 ? 1 : 0;
   const tailorAdvice = compiled.evidencePlan?.operation.type === "tailor_advice";
-  for (const surface of compiled.candidateSurfaces) {
+  const plannedSurfaces = [
+    ...new Set([
+      ...compiled.candidateSurfaces,
+      ...(compiled.evidencePlan?.slots ?? [])
+        .flatMap((slot) => slotLayers(slot))
+        .map((layer) => layerToCandidateSurface(layer))
+        .filter((surface): surface is CandidateSurface => Boolean(surface)),
+    ]),
+  ];
+  for (const surface of plannedSurfaces) {
     switch (surface) {
       case "state":
         budgets.state =
@@ -1064,6 +1073,7 @@ function graphCandidatesForEntities(
 function entityExpansionCandidates(
   store: MemxStoreBundle,
   ctx: MemoryOperationContext,
+  compiled: QueryCompileResult,
   entities: NormalizedEntity[],
   topN: number,
 ): CandidateHit[] {
@@ -1071,10 +1081,16 @@ function entityExpansionCandidates(
     ...new Map(entities.map((entity) => [entity.entityId, entity])).values(),
   ].slice(0, Math.max(3, topN));
   const perEntityLimit = Math.max(2, Math.min(4, topN));
+  const factPerEntityLimit =
+    compiled.answerMode === "multi_evidence" ||
+    compiled.evidencePlan?.operation.type === "compare" ||
+    compiled.evidencePlan?.operation.type === "derive"
+      ? Math.max(perEntityLimit, Math.min(6, topN + 3))
+      : perEntityLimit;
   const candidates = [
     ...graphCandidatesForEntities(store, ctx, uniqueEntities, Math.max(4, topN * 2)),
     ...uniqueEntities.flatMap((entity) =>
-      factCandidatesForEntity(store, ctx, entity, perEntityLimit),
+      factCandidatesForEntity(store, ctx, entity, factPerEntityLimit),
     ),
     ...uniqueEntities.flatMap((entity) =>
       eventCandidatesForEntity(store, ctx, entity, perEntityLimit),
@@ -2314,6 +2330,7 @@ async function retrieveSurfaceHits(
     const expansionCandidates = entityExpansionCandidates(
       store,
       ctx,
+      compiled,
       entityCandidates
         .map((candidate) =>
           typeof candidate.metadata?.entityId === "string"

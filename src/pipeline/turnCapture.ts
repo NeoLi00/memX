@@ -8,7 +8,7 @@ import { readMessageText, stripInboundMetadata } from "./messageText.js";
 const SYSTEM_BOILERPLATE_RE = /^A new session was started via \/new or \/reset\b/;
 const SELF_TOOL_RE = /^memory[_-]/i;
 const ASSISTANT_MEMORY_CONFIRMATION_RE =
-  /(?:\b(?:i(?:'ve| have)? (?:noted|saved|remembered|recorded)|i(?:'ll| will) (?:remember|keep (?:that )?in mind)|noted for future use|saved for later)\b|(?:我(?:已经)?(?:记住|记下|记录|保存)(?:了)?|我会记得|记忆更新确认|供后续使用|后面会用|之后会用|未来使用))/iu;
+  /(?:\b(?:acknowledged|got it|noted|recorded|saved|remembered|understood)\b|\b(?:i(?:'ve| have)? (?:noted|saved|remembered|recorded)|i(?:'ll| will) (?:remember|record|save|keep (?:that )?in mind)|going forward|from now on|noted for future use|saved for later)\b|(?:已(?:记住|记下|记录|保存)|(?:记住|记下|记录|保存)(?:了)?|我(?:已经)?(?:记住|记下|记录|保存)(?:了)?|收到|好的|明白|了解|我会记得|后续(?:我)?会|以后(?:我)?会|我会(?:按|用|照)|记忆更新确认|供后续使用|后面会用|之后会用|未来使用))/iu;
 
 function tokenOverlap(left: string, right: string): number {
   const tokenize = (value: string) => new Set(normalizedTerms(value, { minLength: 2 }));
@@ -49,6 +49,10 @@ function looksLikeRecallEcho(text: string, recalledTexts: string[]): boolean {
 function looksLikeAssistantMemoryConfirmation(text: string): boolean {
   const trimmed = text.trim();
   if (!trimmed) {
+    return false;
+  }
+  const lineCount = trimmed.split(/\r?\n/u).length;
+  if (trimmed.length > 560 || lineCount > 6 || trimmed.includes("```")) {
     return false;
   }
   if (!ASSISTANT_MEMORY_CONFIRMATION_RE.test(trimmed)) {

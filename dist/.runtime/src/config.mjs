@@ -1,5 +1,5 @@
+import { MEMX_NATIVE_HOOK_TIMEOUT_MS, deriveNativeHookBudget } from "./timeouts.mjs";
 import { MEMORY_CONSENT_MODES, MEMORY_EMBEDDING_PROVIDERS, MEMORY_LLM_PROVIDERS, MEMORY_PII_MODES, MEMORY_SCOPE_TEMPLATES } from "./types.mjs";
-import { MEMX_NATIVE_HOOK_TIMEOUT_MS } from "./timeouts.mjs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 //#region src/config.ts
@@ -41,7 +41,7 @@ const DEFAULT_ADVANCED = {
 	recallProbeContinuationEscalateThreshold: .68,
 	enableTurnSemanticCompiler: true,
 	enableQueryCompiler: true,
-	queryCompilerHotPathTimeoutMs: MEMX_NATIVE_HOOK_TIMEOUT_MS,
+	queryCompilerHotPathTimeoutMs: deriveNativeHookBudget(MEMX_NATIVE_HOOK_TIMEOUT_MS).queryCompilerTimeoutMs,
 	enableEmbeddingCandidates: true,
 	enableEmbeddingClustering: true,
 	enableHotPathChunkSummaryLlm: false,
@@ -127,7 +127,7 @@ const uiHints = {
 	},
 	defaultScope: {
 		label: "Default Scope",
-		help: "Default capture scope template. Supports {agentId}, {sessionKey}, and {project}."
+		help: "Default capture scope template. Supports {agentId}, {sessionKey}, {project}, and hashed {workspace}."
 	},
 	allowedScopes: {
 		label: "Allowed Scopes",

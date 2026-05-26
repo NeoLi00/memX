@@ -28,7 +28,7 @@
     "assets"
   ],
   "scripts": {
-    "build": "node scripts/clean-dist.mjs && tsdown index.ts src/bin/memx.ts src/bin/memx-server.ts src/bin/memx-mcp.ts src/bin/memx-hook.ts src/host/uninstall.ts --no-config --unbundle --root . --out-dir dist/.runtime --format esm --target es2023 --platform node --no-treeshake --deps.never-bundle openclaw --deps.never-bundle openclaw/plugin-sdk/core --dts --copy src/search/backends/sentence_transformers_embedder.py && node scripts/write-dist-wrappers.mjs",
+    "build": "node scripts/clean-dist.mjs && tsdown index.ts src/bin/memx.ts src/bin/memx-server.ts src/bin/memx-mcp.ts src/bin/memx-hook.ts src/host/connect.ts src/host/hookPayload.ts src/host/mcpProtocol.ts src/host/quickstart.ts src/host/service.ts src/host/standaloneQuickstart.ts src/host/uninstall.ts src/search/backends/embeddingBackend.ts --no-config --unbundle --root . --out-dir dist/.runtime --format esm --target es2023 --platform node --no-treeshake --deps.never-bundle openclaw --deps.never-bundle openclaw/plugin-sdk/core --dts --copy src/search/backends/sentence_transformers_embedder.py && node scripts/write-dist-wrappers.mjs",
     "test": "node --test tests/*.test.mjs"
   },
   "devDependencies": {

@@ -1,14 +1,14 @@
 import { clamp01, normalizeName, normalizeText, stableHash } from "../support.mjs";
 import { queryAnchorSupport } from "./semantic/heuristics.mjs";
-import { isSnapshotFactualStateKey } from "./authority.mjs";
 import { semanticTextSimilarity } from "./semantic/textSimilarity.mjs";
 import { buildEntityMention, resolveEntityMention } from "./entityResolver.mjs";
-import { capScoreByEvidenceCoverage, evidenceCoverageForText } from "./evidenceCoverage.mjs";
 import { sourceRefsFromMaintenanceMetadata, uniqueMaintenanceRefs } from "./maintenanceContract.mjs";
 import "./semantics.mjs";
 import { describeStateValue, formatFactLine, lineageFromMetadata } from "./memoryObjectsHelpers.mjs";
-import { normalizeSourceRefs } from "./sourceRefs.mjs";
+import { isSnapshotFactualStateKey } from "./authority.mjs";
 import { stateCurrentnessFromVectorMetadata, stateCurrentnessToMetadata, stateCurrentnessVectorMetadata } from "./stateLifecycle.mjs";
+import { capScoreByEvidenceCoverage, evidenceCoverageForText } from "./evidenceCoverage.mjs";
+import { normalizeSourceRefs } from "./sourceRefs.mjs";
 //#region src/pipeline/candidateGeneration.ts
 const CANDIDATE_GENERATION_CUTOVER_CRITERIA = {
 	invariantRegressionMustBeZero: true,
@@ -172,7 +172,8 @@ function deriveSurfaceBudgets(compiled, ctx) {
 	const fidelityBoost = compiled.evidenceFidelity === "high" ? 1 : 0;
 	const supportBoost = compiled.supportNeed >= .72 ? 1 : 0;
 	const tailorAdvice = compiled.evidencePlan?.operation.type === "tailor_advice";
-	for (const surface of compiled.candidateSurfaces) switch (surface) {
+	const plannedSurfaces = [...new Set([...compiled.candidateSurfaces, ...(compiled.evidencePlan?.slots ?? []).flatMap((slot) => slotLayers(slot)).map((layer) => layerToCandidateSurface(layer)).filter((surface) => Boolean(surface))])];
+	for (const surface of plannedSurfaces) switch (surface) {
 		case "state":
 			budgets.state = compiled.queryShape.timeframe === "current" ? max.state : Math.min(2, max.state);
 			break;
@@ -592,12 +593,13 @@ function graphCandidatesForEntities(store, ctx, entities, limit) {
 		};
 	});
 }
-function entityExpansionCandidates(store, ctx, entities, topN) {
+function entityExpansionCandidates(store, ctx, compiled, entities, topN) {
 	const uniqueEntities = [...new Map(entities.map((entity) => [entity.entityId, entity])).values()].slice(0, Math.max(3, topN));
 	const perEntityLimit = Math.max(2, Math.min(4, topN));
+	const factPerEntityLimit = compiled.answerMode === "multi_evidence" || compiled.evidencePlan?.operation.type === "compare" || compiled.evidencePlan?.operation.type === "derive" ? Math.max(perEntityLimit, Math.min(6, topN + 3)) : perEntityLimit;
 	return dedupeCandidateHitsById([
 		...graphCandidatesForEntities(store, ctx, uniqueEntities, Math.max(4, topN * 2)),
-		...uniqueEntities.flatMap((entity) => factCandidatesForEntity(store, ctx, entity, perEntityLimit)),
+		...uniqueEntities.flatMap((entity) => factCandidatesForEntity(store, ctx, entity, factPerEntityLimit)),
 		...uniqueEntities.flatMap((entity) => eventCandidatesForEntity(store, ctx, entity, perEntityLimit)),
 		...uniqueEntities.flatMap((entity) => stateCandidatesForEntity(store, ctx, entity, perEntityLimit))
 	]).sort((left, right) => right.score - left.score).slice(0, Math.max(8, topN * 6));
@@ -1334,7 +1336,7 @@ async function retrieveSurfaceHits(store, ctx, compiled, surface, topN) {
 				canonicalName: entity.canonicalName
 			}
 		}));
-		const expansionCandidates = entityExpansionCandidates(store, ctx, entityCandidates.map((candidate) => typeof candidate.metadata?.entityId === "string" ? store.graphRepo.getEntityById(candidate.metadata.entityId) : null).filter((entity) => Boolean(entity)), topN);
+		const expansionCandidates = entityExpansionCandidates(store, ctx, compiled, entityCandidates.map((candidate) => typeof candidate.metadata?.entityId === "string" ? store.graphRepo.getEntityById(candidate.metadata.entityId) : null).filter((entity) => Boolean(entity)), topN);
 		const candidates = mergeCandidateHits([...entityCandidates, ...expansionCandidates]);
 		return {
 			selectedHits: [],

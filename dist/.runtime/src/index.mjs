@@ -1,28 +1,22 @@
 import { MEMX_BRAND_NAME, MEMX_PLUGIN_ID } from "./identity.mjs";
-import "./host/connect.mjs";
 import { nowIso, randomId, truncateText } from "./support.mjs";
-import "./host/hookPayload.mjs";
-import "./host/mcpProtocol.mjs";
-import { DEFAULT_MEMORY_CONFIG, memxConfigSchema } from "./config.mjs";
-import "./host/quickstart.mjs";
-import "./host/standaloneQuickstart.mjs";
-import { compileQuery } from "./pipeline/queryCompiler.mjs";
 import { semanticTextSimilarity } from "./pipeline/semantic/textSimilarity.mjs";
-import "./pipeline/constants.mjs";
-import { sanitizeFocusedRecallQuery, summarizeBackgroundRecallBundle } from "./pipeline/retrieveTracing.mjs";
 import { emitBackgroundRetrievalSignals } from "./pipeline/signalLedger.mjs";
-import { buildBackgroundRecallBundle, hasBackgroundRecallMaterial, retrieveEvidence } from "./pipeline/retrieve.mjs";
-import { formatMemxContextBlock, stripInjectedHistoricalBlock } from "./security/escaping.mjs";
-import { readMessageText, stripInboundMetadata } from "./pipeline/messageText.mjs";
-import { shouldSkipMemxForHeartbeat } from "./pipeline/heartbeatFilter.mjs";
-import { captureAgentEndTurn } from "./pipeline/turnCapture.mjs";
+import "./pipeline/constants.mjs";
+import { compileQuery } from "./pipeline/queryCompiler.mjs";
 import "./pipeline/turnSemanticCompiler.mjs";
 import "./pipeline/reasoner.mjs";
-import { resolveDefaultScope } from "./security/scopes.mjs";
+import { formatMemxContextBlock, stripInjectedHistoricalBlock } from "./security/escaping.mjs";
+import { resolveDefaultScope, scopeVarsForContext } from "./security/scopes.mjs";
 import { MemxRuntimeManager, buildOperationContext } from "./runtime.mjs";
-import "./host/service.mjs";
 import { registerMemxCli } from "./cli/registerCli.mjs";
+import { DEFAULT_MEMORY_CONFIG, memxConfigSchema } from "./config.mjs";
 import { selectAgentEndMessagesForCapture } from "./pipeline/agentEndMessages.mjs";
+import { readMessageText, stripInboundMetadata } from "./pipeline/messageText.mjs";
+import { shouldSkipMemxForHeartbeat } from "./pipeline/heartbeatFilter.mjs";
+import { sanitizeFocusedRecallQuery, summarizeBackgroundRecallBundle } from "./pipeline/retrieveTracing.mjs";
+import { buildBackgroundRecallBundle, hasBackgroundRecallMaterial, retrieveEvidence } from "./pipeline/retrieve.mjs";
+import { captureAgentEndTurn } from "./pipeline/turnCapture.mjs";
 import { createMemxTools } from "./plugin-tools.mjs";
 //#region src/index.ts
 function shouldSuggestExplicitRecallTool(config) {
@@ -460,12 +454,7 @@ function createMemoryMemxPlugin() {
 					let captured = [];
 					if (config.advanced.enableTurnScheduler) {
 						const recall = manager.consumeRecall(ctx.agentId, ctx.sessionKey);
-						const captureScope = resolveDefaultScope(config, {
-							agentId: ctx.agentId,
-							sessionKey,
-							project: opCtx.project,
-							workspace: opCtx.workspaceDir
-						});
+						const captureScope = resolveDefaultScope(config, scopeVarsForContext(opCtx));
 						captured = captureAgentEndTurn({
 							agentId: ctx.agentId,
 							scope: captureScope,

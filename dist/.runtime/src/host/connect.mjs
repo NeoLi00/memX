@@ -1,7 +1,7 @@
 import { MEMX_INSTALL_SPEC } from "../identity.mjs";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 //#region src/host/connect.ts
 const PACKAGE_SPEC = MEMX_INSTALL_SPEC;
 const DEFAULT_URL = "http://127.0.0.1:3878";

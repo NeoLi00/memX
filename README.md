@@ -95,17 +95,22 @@ want to override that default. Use `--dry-run` to preview the files and exec-for
 writing anything.
 
 For Codex and Claude Code, native hooks are the default lifecycle path for automatic recall and
-turn capture. Their MCP server uses `--mcp-tools none` by default, so no memX tools are exposed to
-the agent; this prevents duplicate recall/write and prevents the agent from reading audit data as a
+turn capture. Quickstart installs the native plugin, writes the shared memX config, starts or
+refreshes the managed local memX service, and keeps MCP memory tools hidden with `--mcp-tools none`
+by default. This prevents duplicate recall/write and prevents the agent from reading audit data as a
 side channel. Use `--mcp-tools full` only when you intentionally want the agent to see the complete
 MCP tool set. Generic MCP quickstart stays `full` by default because it has no native lifecycle
 hooks. Default native memories are also host-scoped, so Codex and Claude Code do not share the same
 local database unless you deliberately override the database path and actor settings.
 
+If `http://127.0.0.1:3878` is already used by an unmanaged memX-compatible service, quickstart stops
+instead of silently reusing it. Stop the old service or pass a free local URL, for example
+`--memx-url http://127.0.0.1:3888`.
+
 ### Claude Code
 
 This installs the shared memX config, a local Claude Code plugin marketplace, native lifecycle
-hooks, and the plugin-provided MCP server in one run.
+hooks, and the managed local memX service in one run.
 
 ```bash
 npx -y -p github:NeoLi00/memX memx quickstart claude-code \
@@ -117,7 +122,8 @@ npx -y -p github:NeoLi00/memX memx quickstart claude-code \
 
 ### Codex
 
-This installs the shared memX config, Codex MCP config, and native lifecycle hooks in one run.
+This installs the shared memX config, a local Codex plugin marketplace, native lifecycle hooks, and
+the managed local memX service in one run.
 
 ```bash
 npx -y -p github:NeoLi00/memX memx quickstart codex \
@@ -139,6 +145,10 @@ npx -y -p github:NeoLi00/memX memx quickstart openclaw \
 
 ### Generic MCP
 
+Use this path for MCP clients that do not have a native memX lifecycle adapter. Quickstart writes the
+shared memX config, starts the managed local memX service, and prints a ready-to-copy MCP server
+config.
+
 ```bash
 npx -y -p github:NeoLi00/memX memx quickstart mcp \
   --llm-provider openai-compatible \
@@ -147,17 +157,22 @@ npx -y -p github:NeoLi00/memX memx quickstart mcp \
   --llm-api-key sk-your-provider-key
 ```
 
-For Claude Code, Codex, and generic MCP clients, start the shared local service after configuration:
+### Service management
 
 ```bash
-npx -y -p github:NeoLi00/memX memx-server
+npx -y -p github:NeoLi00/memX memx service status
+npx -y -p github:NeoLi00/memX memx service restart
+npx -y -p github:NeoLi00/memX memx service stop
 ```
+
+Use the same `--home`, `--memx-url`, and `--memx-secret` values that you used during quickstart when
+you manage a non-default install.
 
 ## Clean uninstall
 
 Each uninstall command backs up the target config first, then removes only memX-owned entries.
-Claude Code and Codex cleanup also uninstall the native plugin, remove the local marketplace, and
-delete the generated marketplace snapshot.
+Claude Code and Codex cleanup also stop the managed local service, uninstall the native plugin,
+remove the local marketplace, and delete the generated marketplace snapshot.
 OpenClaw cleanup also removes stale `memx` / `memory-memx` slot, allow, and entry references, then
 best-effort uninstalls both current and legacy plugin files if OpenClaw can still see them.
 

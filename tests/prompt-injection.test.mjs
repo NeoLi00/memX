@@ -96,6 +96,36 @@ test("turn capture excludes memX prepend context from the captured user message"
   );
 });
 
+test("turn capture suppresses concise assistant memory acknowledgements", () => {
+  const captured = captureAgentEndTurn({
+    agentId: "main",
+    scope: "global",
+    sessionKey: "agent:main:test",
+    turnId: "turn_ack",
+    observedAt: "2026-05-11T00:00:00.000Z",
+    messages: [
+      {
+        role: "user",
+        content: "工程记录：AuroraBridge 的默认告警通道是 RelayNine。",
+      },
+      {
+        role: "assistant",
+        content: "已记录，AuroraBridge 默认告警通道是 RelayNine。",
+      },
+    ],
+  });
+
+  assert.deepEqual(
+    captured.map((entry) => ({ role: entry.role, content: entry.content })),
+    [
+      {
+        role: "user",
+        content: "工程记录：AuroraBridge 的默认告警通道是 RelayNine。",
+      },
+    ],
+  );
+});
+
 test("compiled recall hook returns prependContext rather than overriding systemPrompt", async () => {
   const compiled = await readFile(new URL("../dist/.runtime/src/index.mjs", import.meta.url), "utf8");
 

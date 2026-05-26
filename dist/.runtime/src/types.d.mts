@@ -23,7 +23,7 @@ declare const ENTITY_TYPES: readonly ["person", "project", "tool", "service", "l
 declare const GRAPH_NODE_KINDS: readonly ["entity", "task", "state", "fact", "event", "outcome"];
 declare const MEMORY_CLASSES: readonly ["current-state", "stable-fact", "episodic-event", "graph-worthy", "ignore"];
 declare const MEMORY_SOURCE_KINDS: readonly ["user", "assistant", "tool"];
-declare const MEMORY_SCOPE_TEMPLATES: readonly ["global", "agent:{agentId}", "session:{sessionKey}", "project:{project}"];
+declare const MEMORY_SCOPE_TEMPLATES: readonly ["global", "workspace:{workspace}", "agent:{agentId}", "session:{sessionKey}", "project:{project}"];
 declare const MEMORY_PII_MODES: readonly ["off", "redact", "allow"];
 declare const MEMORY_CONSENT_MODES: readonly ["explicit", "implicit", "off"];
 declare const MEMORY_EMBEDDING_PROVIDERS: readonly ["off", "openai-compatible", "ollama", "sentence-transformers-local"];
@@ -751,6 +751,12 @@ type QuerySuppressedEntityHint = {
   type?: EntityType;
   reason?: string;
 };
+type QueryContextExclusionKind = "prior_project" | "prior_topic" | "prior_context" | "host_native_memory";
+type QueryContextExclusion = {
+  kind: QueryContextExclusionKind;
+  label: string;
+  reason?: string;
+};
 type CandidateSurface = "state" | "fact" | "event" | "task" | "chunk" | "snippet" | "graph" | "entity_alias";
 type QueryEvidenceGoal = {
   goal: string;
@@ -768,6 +774,7 @@ type QueryEvidenceSlot = {
   description: string;
   subjectHints: string[];
   relationHints?: string[];
+  requestedAttributeSlots?: string[];
   capabilityQueries?: string[];
   negativeHints?: string[];
   requiredFields: string[];
@@ -811,6 +818,7 @@ type QueryCompileResult = {
   focusedQuery: string;
   queryEntities: QueryEntityHint[];
   suppressedEntities: QuerySuppressedEntityHint[];
+  contextExclusions: QueryContextExclusion[];
   queryShape: RecallQueryShape;
   primaryRoute?: MemoryPrimaryRouteType;
   answerGranularity: AnswerGranularity;
@@ -1192,6 +1200,34 @@ type EvidencePacketAudit = {
     normalizedSourceRefs?: NormalizedSourceRef[];
     normalizedAllSourceRefs?: NormalizedSourceRef[];
     selectionReason?: string;
+  }>;
+  eligibleEvidencePackets?: Array<{
+    packetId: string;
+    injected: boolean;
+    score?: number;
+    finalScore?: number;
+    sourceRefs: string[];
+    allSourceRefs: string[];
+    normalizedSourceRefs?: NormalizedSourceRef[];
+    normalizedAllSourceRefs?: NormalizedSourceRef[];
+    primaryText: string;
+    displayLines?: string[];
+    selectionReason?: string;
+  }>;
+  droppedEvidencePackets?: Array<{
+    packetId: string;
+    score?: number;
+    finalScore?: number;
+    sourceRefs: string[];
+    allSourceRefs: string[];
+    normalizedSourceRefs?: NormalizedSourceRef[];
+    normalizedAllSourceRefs?: NormalizedSourceRef[];
+    primaryText: string;
+    displayLines?: string[];
+    dropReason: string;
+    selectionReason?: string;
+    softPenalties?: string[];
+    hardExclusions?: string[];
   }>;
   injectedPackets?: string[];
   renderedPromptLines?: Array<{
@@ -1585,6 +1621,7 @@ type TaskAssignmentDecision = {
 type RetrievalAuditRecord = {
   auditId: string;
   agentId: string;
+  sessionKey?: string;
   scope: string;
   routeType: MemoryRouteType;
   queryText: string;
@@ -1669,11 +1706,30 @@ type MemoryBeliefRecord = {
 type MaintenanceRunRecord = {
   runId: string;
   agentId: string;
+  sessionKey?: string;
   jobType: string;
   statsJson: Record<string, unknown>;
   startedAt: string;
   completedAt?: string;
   status: "running" | "completed" | "failed";
+};
+type SemanticWriteJobStatus = "pending" | "running" | "succeeded" | "retrying" | "failed";
+type SemanticWriteJobRecord = {
+  jobId: string;
+  agentId: string;
+  sessionKey: string;
+  scope: string;
+  turnId: string;
+  jobType: "turn_semantic_extraction";
+  sourceRefs: string[];
+  inputHash: string;
+  status: SemanticWriteJobStatus;
+  attemptCount: number;
+  lastError?: string;
+  resultJson: Record<string, unknown>;
+  nextAttemptAt?: string;
+  createdAt: string;
+  updatedAt: string;
 };
 type MaintenanceBatchTriggerReason = "threshold" | "idle" | "shutdown";
 type MaintenanceBatchWatermarks = {
@@ -1770,4 +1826,4 @@ type MemxLogger = {
   error?: (message: string) => void;
 };
 //#endregion
-export { AbstractionCandidateRecord, AbstractionCandidateStage, ConversationChunk, ConversationTask, EvidenceBundle, MemoryAction, MemoryCallProvenance, MemoryCandidate, MemoryCandidateDecisionHint, MemoryCandidatePreferenceHint, MemoryCandidateRelationHint, MemoryCandidateStructuredHints, MemoryCandidateWorkflowHint, MemoryEmbeddingProvider, MemoryLlmBudgetAudit, MemoryLlmCallStage, MemoryLlmProvider, MemoryOperationContext, MemoryPluginConfig, MemoryPrimaryRouteType, MemoryRecallPlan, MemxLogger, NormalizedEvent, QueryCompileResult, RouteDecision, RouteEvidenceCandidate, RouteEvidenceDecision, RoutePriorDecision, SearchHit, SourceSegmentRecord, SynthesizedTaskEvent, TaskAssignmentDecision, TaskAssignmentSnapshot, TurnCaptureMessage, TurnSemanticFrame, TurnSemanticReferenceContext, TurnSemanticTaskProposal };
+export { AbstractionCandidateRecord, AbstractionCandidateStage, ConversationChunk, ConversationTask, EmbeddingConfig, EvidenceBundle, MemoryAction, MemoryCallProvenance, MemoryCandidate, MemoryCandidateDecisionHint, MemoryCandidatePreferenceHint, MemoryCandidateRelationHint, MemoryCandidateStructuredHints, MemoryCandidateWorkflowHint, MemoryEmbeddingProvider, MemoryLlmBudgetAudit, MemoryLlmCallStage, MemoryLlmProvider, MemoryOperationContext, MemoryPluginConfig, MemoryPrimaryRouteType, MemoryRecallPlan, MemxLogger, NormalizedEvent, QueryCompileResult, RetrievalBackend, RetrievalSearchParams, RouteDecision, RouteEvidenceCandidate, RouteEvidenceDecision, RoutePriorDecision, SearchHit, SourceSegmentRecord, SynthesizedTaskEvent, TaskAssignmentDecision, TaskAssignmentSnapshot, TurnCaptureMessage, TurnSemanticFrame, TurnSemanticReferenceContext, TurnSemanticTaskProposal, VectorDocRecord };

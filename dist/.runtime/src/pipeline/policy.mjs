@@ -1,12 +1,12 @@
 import { clamp01, normalizeText } from "../support.mjs";
-import { inferWriteLlmStage, recordMemoryLlmBudgetCall } from "./llmBudgetAudit.mjs";
 import { hasExplicitRememberIntent, isLowValueChatter, isQuestionLike } from "./semantic/heuristics.mjs";
-import { sanitizeWorkflowHint } from "./authority.mjs";
+import { inferWriteLlmStage, recordMemoryLlmBudgetCall } from "./llmBudgetAudit.mjs";
 import { containsLikelySecret, looksLikePromptInjection } from "../security/injection.mjs";
 import { canonicalizePreferenceHint } from "./semantics.mjs";
+import { sanitizeWorkflowHint } from "./authority.mjs";
+import { containsSensitiveValue, sensitivityScore } from "../security/pii.mjs";
 import { DEFAULT_SCORES, SENSITIVITY_PROMPT_INJECTION_BOOST, SENSITIVITY_SENSITIVE_VALUE_BOOST } from "./constants.mjs";
 import { containsUntrustedBanner } from "../security/escaping.mjs";
-import { containsSensitiveValue, sensitivityScore } from "../security/pii.mjs";
 //#region src/pipeline/policy.ts
 const HYPOTHETICAL_REFERENCE_RULE_PATTERN = /(?:如果我(?:突然)?(?:问|说)|如果之后我(?:问|说)|当我(?:说|问)|以后我(?:说|问)).{0,80}(?:应该知道|应该带上|需要带上|得能接上|你应该|要能关联)/iu;
 function isHypotheticalReferenceRule(text) {

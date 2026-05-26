@@ -1,12 +1,12 @@
 import { normalizeText, nowIso, objectRecord, randomId, stableHash } from "../support.mjs";
-import { snapshotMemoryLlmBudgetAudit } from "./llmBudgetAudit.mjs";
 import { refreshEntityProfileDocs } from "./entityProfile.mjs";
 import { buildEntityMention, resolveEntityMention } from "./entityResolver.mjs";
+import { snapshotMemoryLlmBudgetAudit } from "./llmBudgetAudit.mjs";
 import { buildMaintenanceContractMetadata, summarizeMaintenanceContractDiagnostics, uniqueMaintenanceRefs } from "./maintenanceContract.mjs";
-import { buildTaskSummaryEvidenceSet, taskSummaryMetadataFields, taskSummaryNeedsUpgrade, taskSummarySource, taskSummaryUpgradePriority } from "./taskSummary.mjs";
-import { emitBeliefMaintenanceSignals } from "./signalLedger.mjs";
 import { deriveStrategyHypotheses } from "./strategyHypotheses.mjs";
+import { emitBeliefMaintenanceSignals } from "./signalLedger.mjs";
 import { aggregateBeliefs } from "./beliefAggregation.mjs";
+import { buildTaskSummaryEvidenceSet, taskSummaryMetadataFields, taskSummaryNeedsUpgrade, taskSummarySource, taskSummaryUpgradePriority } from "./taskSummary.mjs";
 //#region src/pipeline/consolidate.ts
 const MAX_CONSOLIDATION_CONFIRMATIONS_PER_KIND = 6;
 const MAX_TASK_SUMMARY_UPGRADES_PER_RUN = 3;
@@ -153,6 +153,7 @@ async function runConsolidation(store, ctx, options = {}) {
 	const runStartedAt = nowIso();
 	const runId = store.auditRepo.startMaintenance({
 		agentId: ctx.agentId,
+		sessionKey: options.batch?.sessionKey ?? ctx.sessionKey,
 		jobType: "consolidate",
 		stats: {},
 		startedAt: runStartedAt

@@ -1,11 +1,11 @@
 import { normalizeName, normalizeText, nowIso, stableHash } from "./support.mjs";
-import { compileQuery } from "./pipeline/queryCompiler.mjs";
 import { expandStateKeyAliases } from "./pipeline/semantic/heuristics.mjs";
 import "./pipeline/semantics.mjs";
-import { retrieveEvidence } from "./pipeline/retrieve.mjs";
 import { buildStoredFactObjectValueJson } from "./pipeline/normalize.mjs";
-import { isScopeAllowed, resolveDefaultScope } from "./security/scopes.mjs";
+import { compileQuery } from "./pipeline/queryCompiler.mjs";
+import { isScopeAllowed, resolveDefaultScope, scopeVarsForContext } from "./security/scopes.mjs";
 import { buildOperationContext } from "./runtime.mjs";
+import { retrieveEvidence } from "./pipeline/retrieve.mjs";
 import { Type, jsonToolResult, readBoolean, readNumber, readString, stringEnum } from "./tooling.mjs";
 //#region src/plugin-tools.ts
 const FORGET_KINDS = [
@@ -22,18 +22,8 @@ function resolveToolContext(toolCtx, config) {
 	});
 }
 function resolveScope(scope, config, ctx) {
-	if (!scope) return resolveDefaultScope(config, {
-		agentId: ctx.agentId,
-		sessionKey: ctx.sessionKey,
-		project: ctx.project,
-		workspace: ctx.workspaceDir
-	});
-	if (!isScopeAllowed(scope, config, {
-		agentId: ctx.agentId,
-		sessionKey: ctx.sessionKey,
-		project: ctx.project,
-		workspace: ctx.workspaceDir
-	})) throw new Error(`scope not allowed: ${scope}`);
+	if (!scope) return resolveDefaultScope(config, scopeVarsForContext(ctx));
+	if (!isScopeAllowed(scope, config, scopeVarsForContext(ctx))) throw new Error(`scope not allowed: ${scope}`);
 	return scope;
 }
 function countTable(store, table) {

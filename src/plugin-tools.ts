@@ -5,7 +5,7 @@ import { compileQuery } from "./pipeline/queryCompiler.js";
 import { retrieveEvidence } from "./pipeline/retrieve.js";
 import { expandStateKeyAliases } from "./pipeline/semantics.js";
 import { buildOperationContext, type MemxRuntimeManager } from "./runtime.js";
-import { isScopeAllowed, resolveDefaultScope } from "./security/scopes.js";
+import { isScopeAllowed, resolveDefaultScope, scopeVarsForContext } from "./security/scopes.js";
 import { nowIso, normalizeName, normalizeText, stableHash } from "./support.js";
 import { jsonToolResult, readBoolean, readNumber, readString, stringEnum, Type } from "./tooling.js";
 import type { MemoryPluginConfig, MemxLogger } from "./types.js";
@@ -34,21 +34,9 @@ function resolveScope(
   ctx: NonNullable<ReturnType<typeof buildOperationContext>>,
 ) {
   if (!scope) {
-    return resolveDefaultScope(config, {
-      agentId: ctx.agentId,
-      sessionKey: ctx.sessionKey,
-      project: ctx.project,
-      workspace: ctx.workspaceDir,
-    });
+    return resolveDefaultScope(config, scopeVarsForContext(ctx));
   }
-  if (
-    !isScopeAllowed(scope, config, {
-      agentId: ctx.agentId,
-      sessionKey: ctx.sessionKey,
-      project: ctx.project,
-      workspace: ctx.workspaceDir,
-    })
-  ) {
+  if (!isScopeAllowed(scope, config, scopeVarsForContext(ctx))) {
     throw new Error(`scope not allowed: ${scope}`);
   }
   return scope;

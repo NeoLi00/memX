@@ -23,6 +23,18 @@ function nearestToolDistance(chunks, index) {
 	}
 	return bestDistance;
 }
+const ASSISTANT_ACK_CUE_RE = /(?:\b(?:acknowledged|got it|noted|recorded|saved|remembered|understood)\b|\b(?:i(?:'ll| will| have|’ll) (?:remember|record|save|keep|use|treat)|going forward|from now on)\b|(?:已(?:记住|记下|记录|保存)|(?:记住|记下|记录|保存)(?:了)?|收到|好的|明白|了解|后续(?:我)?会|以后(?:我)?会|我会(?:记得|按|用|照)))/iu;
+function looksLikeAssistantAcknowledgement(chunk, taskChunks, assessment) {
+	const trimmed = chunk.content.trim();
+	if (!trimmed || chunk.role !== "assistant") return false;
+	const lineCount = trimmed.split(/\r?\n/u).length;
+	if (trimmed.length > 560 || lineCount > 6 || trimmed.includes("```")) return false;
+	if (!ASSISTANT_ACK_CUE_RE.test(trimmed)) return false;
+	const index = taskChunks.findIndex((entry) => entry.chunkId === chunk.chunkId);
+	const supportText = index >= 0 ? surroundingSupportText(taskChunks, index) : "";
+	const echoScore = supportText ? Math.max(semanticTextSimilarity(trimmed, supportText), semanticTextSimilarity(chunk.summary || trimmed, supportText)) : assessment.grounding;
+	return /\b(?:remember|record|save|noted|saved|recorded|remembered)\b|(?:记住|记下|记录|保存)/iu.test(trimmed) ? echoScore >= .18 || supportText.length === 0 : echoScore >= .42;
+}
 function assessAssistantChunk(chunk, taskChunks) {
 	if (chunk.role !== "assistant") return {
 		weight: 1,
@@ -41,11 +53,20 @@ function assessAssistantChunk(chunk, taskChunks) {
 	const longTutorialPenalty = toolDistance === null && trimmed.length > 900 && lineCount > 10 && complexity > .56 ? .18 : 0;
 	const conciseAssistantBonus = trimmed.length > 0 && trimmed.length <= 360 && lineCount <= 5 && complexity <= .38 ? .24 : 0;
 	const weight = clamp01(.28 + grounding * .46 + toolSupport + conciseAssistantBonus - complexity * .28 - longTutorialPenalty);
+	const acknowledgement = looksLikeAssistantAcknowledgement(chunk, taskChunks, {
+		grounding,
+		complexity
+	});
 	return {
-		weight,
+		weight: acknowledgement ? Math.min(weight, .34) : weight,
 		grounding,
 		complexity,
-		useSummaryOnly: weight < .58 || complexity > .68
+		useSummaryOnly: acknowledgement || weight < .58 || complexity > .68,
+		...acknowledgement ? {
+			semanticRole: "assistant_acknowledgement",
+			memoryClass: "assistant_acknowledgement",
+			recallVisibility: "support_only"
+		} : {}
 	};
 }
 function renderTaskPromptChunk(chunk, taskChunks) {

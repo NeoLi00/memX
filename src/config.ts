@@ -11,7 +11,7 @@ import {
   type EmbeddingConfig,
   type MemoryPluginConfig,
 } from "./types.js";
-import { MEMX_NATIVE_HOOK_TIMEOUT_MS } from "./timeouts.js";
+import { deriveNativeHookBudget, MEMX_NATIVE_HOOK_TIMEOUT_MS } from "./timeouts.js";
 
 const DEFAULT_DB_PATH = join(
   homedir(),
@@ -60,7 +60,8 @@ const DEFAULT_ADVANCED: AdvancedMemoryConfig = {
   recallProbeContinuationEscalateThreshold: 0.68,
   enableTurnSemanticCompiler: true,
   enableQueryCompiler: true,
-  queryCompilerHotPathTimeoutMs: MEMX_NATIVE_HOOK_TIMEOUT_MS,
+  queryCompilerHotPathTimeoutMs: deriveNativeHookBudget(MEMX_NATIVE_HOOK_TIMEOUT_MS)
+    .queryCompilerTimeoutMs,
   enableEmbeddingCandidates: true,
   enableEmbeddingClustering: true,
   enableHotPathChunkSummaryLlm: false,
@@ -136,7 +137,7 @@ const uiHints: Record<string, PluginConfigUiHint> = {
   },
   defaultScope: {
     label: "Default Scope",
-    help: "Default capture scope template. Supports {agentId}, {sessionKey}, and {project}.",
+    help: "Default capture scope template. Supports {agentId}, {sessionKey}, {project}, and hashed {workspace}.",
   },
   allowedScopes: {
     label: "Allowed Scopes",

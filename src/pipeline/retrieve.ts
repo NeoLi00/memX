@@ -380,10 +380,16 @@ function taskProject(task: { metadataJson?: Record<string, unknown> }): string {
   return taskMetadataValue(task, "project");
 }
 
-function uniqueNonEmpty(values: string[], limit = Number.POSITIVE_INFINITY): string[] {
+function uniqueNonEmpty(
+  values: Array<string | null | undefined>,
+  limit = Number.POSITIVE_INFINITY,
+): string[] {
   const seen = new Set<string>();
   const ordered: string[] = [];
   for (const value of values) {
+    if (!value) {
+      continue;
+    }
     const trimmed = value.trim();
     if (!trimmed) {
       continue;
@@ -3835,6 +3841,7 @@ function resolveReferentialQueryAnchors(
   store: MemxStoreBundle,
   ctx: MemoryOperationContext,
   query: string,
+  queryAnalysis?: Pick<QueryCompileResult, "contextExclusions">,
 ): { anchors: string[]; reasons: string[] } {
   const reasons: string[] = [];
   const recentTasks = uniqueTasksById(
@@ -3883,7 +3890,10 @@ function resolveReferentialQueryAnchors(
   const activeProject = authoritativeActiveProject || (activeTask ? taskProject(activeTask) : "");
   const anchors: string[] = [];
 
-  if (/(?:前一个项目|上一个项目|previous project|last project)/iu.test(query)) {
+  const excludesPriorProject = (queryAnalysis?.contextExclusions ?? []).some(
+    (exclusion) => exclusion.kind === "prior_project" || exclusion.kind === "prior_context",
+  );
+  if (!excludesPriorProject && /(?:前一个项目|上一个项目|previous project|last project)/iu.test(query)) {
     const previousProject =
       projectMentionSequence[1] ??
       projectCandidates.find(
@@ -5766,7 +5776,7 @@ export async function retrieveEvidence(
           reasoner: store.reasoner,
         })
       : analyzeRecallQuery(query));
-  const referentResolution = resolveReferentialQueryAnchors(store, ctx, query);
+  const referentResolution = resolveReferentialQueryAnchors(store, ctx, query, queryAnalysis);
   const retrievalQuery = appendAnchorsToQuery(query, referentResolution.anchors);
   const retrievalSearchQuery = appendAnchorsToQuery(searchQuery, referentResolution.anchors);
   const snapshotFocus = queryAnalysis.queryShape.timeframe === "current";
@@ -6413,7 +6423,7 @@ export async function retrieveEvidence(
           selectionReason: entry.selectionReason,
           text: truncateText(entry.text, 360),
         })),
-      evidencePackets: bundle.evidencePackets.map((packet) => ({
+      evidencePackets: bundle.evidencePackets.filter((packet) => !packet.dropReason).map((packet) => ({
         packetId: packet.packetId,
         slotId: packet.slotId,
         operationType: packet.operationType,
@@ -6470,6 +6480,31 @@ export async function retrieveEvidence(
         primaryText: truncateText(packet.primaryText, 720),
         supportingTexts: packet.supportingTexts.map((text) => truncateText(text, 360)),
       })),
+      droppedEvidencePackets: bundle.evidencePackets
+        .filter((packet) => packet.dropReason)
+        .map((packet) => ({
+          packetId: packet.packetId,
+          slotId: packet.slotId,
+          operationType: packet.operationType,
+          role: packet.role,
+          injected: packet.injected,
+          layers: packet.layers,
+          sourceRefs: packet.sourceRefs,
+          normalizedSourceRefs: packet.normalizedSourceRefs,
+          allSourceRefs: packet.allSourceRefs,
+          normalizedAllSourceRefs: packet.normalizedAllSourceRefs,
+          score: packet.score,
+          scoreBreakdown: packet.scoreBreakdown,
+          displayLines: packet.displayLines,
+          selectionReason: packet.selectionReason,
+          blockedBy: packet.blockedBy,
+          softPenalties: packet.softPenalties,
+          hardExclusions: packet.hardExclusions,
+          coverage: packet.coverage,
+          dropReason: packet.dropReason,
+          primaryText: truncateText(packet.primaryText, 720),
+          supportingTexts: packet.supportingTexts.map((text) => truncateText(text, 360)),
+        })),
       rankedInjectedPackets: bundle.evidencePackets
         .filter((packet) => packet.injected || packet.protected)
         .sort((left, right) => (right.score ?? 0) - (left.score ?? 0))
@@ -6626,6 +6661,7 @@ export async function retrieveEvidence(
     store.auditRepo.recordRetrieval({
       auditId,
       agentId: ctx.agentId,
+      sessionKey: ctx.sessionKey,
       scope: ctx.scopes.join(","),
       routeType: bundle.routeType,
       queryText: query,

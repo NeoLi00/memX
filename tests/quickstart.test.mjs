@@ -173,6 +173,16 @@ test("OpenClaw quickstart installs a sanitized package snapshot by default", asy
         assert.equal(existsSync(join(installSource, "package.json")), true);
         assert.equal(existsSync(join(installSource, "dist", "index.mjs")), true);
         assert.equal(existsSync(join(installSource, "src")), false);
+        assert.equal(existsSync(join(installSource, ".codex-plugin")), false);
+        assert.equal(existsSync(join(installSource, ".claude-plugin")), false);
+        assert.equal(existsSync(join(installSource, "hooks")), false);
+        assert.equal(existsSync(join(installSource, "dist", ".runtime", "src", "bin")), false);
+        assert.equal(existsSync(join(installSource, "dist", ".runtime", "src", "host")), false);
+        const snapshotPackage = JSON.parse(readFileSync(join(installSource, "package.json"), "utf8"));
+        assert.equal(snapshotPackage.bin, undefined);
+        assert.deepEqual(snapshotPackage.openclaw.extensions, ["./dist/index.mjs"]);
+        const pluginEntry = readFileSync(join(installSource, "dist", ".runtime", "src", "index.mjs"), "utf8");
+        assert.doesNotMatch(pluginEntry, /host\/(?:quickstart|standaloneQuickstart|hookRunner|mcpProtocol|httpServer)/);
         return { code: 0, stdout: "", stderr: "" };
       },
     },

@@ -1,8 +1,8 @@
 import { truncateText } from "../support.mjs";
 import { MEMX_TRANSCRIPT_CAPTURE_TIMEOUT_MS } from "../timeouts.mjs";
+import { open, readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
-import { open, readdir, stat } from "node:fs/promises";
 //#region src/host/transcript.ts
 const MAX_TRANSCRIPT_BYTES = 2e6;
 const MAX_DISCOVERY_DEPTH = 7;
@@ -168,7 +168,9 @@ async function discoverTranscriptPath(hostId, sessionId) {
 	if (process.env["MEMX_TRANSCRIPT_DISCOVERY"] === "0") return;
 	const roots = hostId === "codex" ? [join(process.env["CODEX_HOME"] || join(homedir(), ".codex"), "sessions")] : hostId === "claude-code" ? [join(process.env["CLAUDE_CONFIG_DIR"] || join(homedir(), ".claude"), "projects"), join(process.env["CLAUDE_HOME"] || join(homedir(), ".claude"), "projects")] : [];
 	const files = (await Promise.all(roots.map((root) => discoverJsonlFiles(root)))).flat().sort((left, right) => right.mtimeMs - left.mtimeMs).slice(0, MAX_DISCOVERY_FILES);
-	return files.find((entry) => basename(entry.path).includes(sessionId))?.path ?? files[0]?.path;
+	const exactSessionMatch = files.find((entry) => basename(entry.path).includes(sessionId))?.path;
+	if (exactSessionMatch) return exactSessionMatch;
+	if (process.env["MEMX_TRANSCRIPT_DISCOVERY_FALLBACK"] === "1") return files[0]?.path;
 }
 async function extractAssistantFromTranscript(params) {
 	const path = params.transcriptPath ?? await discoverTranscriptPath(params.hostId, params.sessionId);
@@ -203,12 +205,12 @@ async function extractAssistantFromTranscript(params) {
 		}
 	};
 }
-async function completeEnvelopeFromTranscript(envelope, pending) {
+async function completeEnvelopeFromTranscript(envelope, pending, options = {}) {
 	if (envelope.messages.some((message) => message.role === "assistant" && message.content.trim())) return envelope;
 	const expectedUserText = [...pending?.messages ?? []].reverse().find((message) => message.role === "user" && message.content.trim())?.content;
-	const transcriptPath = envelope.metadata && typeof envelope.metadata.transcriptPath === "string" ? envelope.metadata.transcriptPath : void 0;
-	const timeoutMs = parsePositiveInt(process.env["MEMX_TRANSCRIPT_CAPTURE_TIMEOUT_MS"], MEMX_TRANSCRIPT_CAPTURE_TIMEOUT_MS);
-	const intervalMs = parsePositiveInt(process.env["MEMX_TRANSCRIPT_CAPTURE_INTERVAL_MS"], 50);
+	const transcriptPath = envelope.metadata && typeof envelope.metadata.transcriptPath === "string" ? envelope.metadata.transcriptPath : pending?.metadata && typeof pending.metadata.transcriptPath === "string" ? pending.metadata.transcriptPath : void 0;
+	const timeoutMs = parsePositiveInt(options.timeoutMs !== void 0 ? String(options.timeoutMs) : process.env["MEMX_TRANSCRIPT_CAPTURE_TIMEOUT_MS"], MEMX_TRANSCRIPT_CAPTURE_TIMEOUT_MS);
+	const intervalMs = parsePositiveInt(options.intervalMs !== void 0 ? String(options.intervalMs) : process.env["MEMX_TRANSCRIPT_CAPTURE_INTERVAL_MS"], 50);
 	const startedAt = Date.now();
 	let capture = null;
 	do {

@@ -1,4 +1,18 @@
+import { resolveUserPath, stableHash } from "../support.mjs";
 //#region src/security/scopes.ts
+function workspaceScopeValue(workspaceDir) {
+	const trimmed = workspaceDir?.trim();
+	if (!trimmed) return "default";
+	return stableHash([resolveUserPath(trimmed)]).slice(0, 16);
+}
+function scopeVarsForContext(input) {
+	return {
+		agentId: input.agentId,
+		sessionKey: input.sessionKey,
+		project: input.project,
+		workspace: workspaceScopeValue(input.workspaceDir)
+	};
+}
 function renderTemplate(input, vars) {
 	return input.replaceAll("{agentId}", vars.agentId ?? "").replaceAll("{sessionKey}", vars.sessionKey ?? "").replaceAll("{project}", vars.project ?? "").replaceAll("{workspace}", vars.workspace ?? "");
 }
@@ -22,15 +36,16 @@ function isScopeAllowed(scope, config, vars) {
 function defaultRetrievalScopes(config, vars) {
 	const allowed = resolveAllowedScopes(config, vars);
 	const scopes = /* @__PURE__ */ new Set();
-	for (const entry of allowed) {
-		if (entry === "global") scopes.add(entry);
-		if (vars.agentId && entry === `agent:${vars.agentId}`) scopes.add(entry);
-		if (vars.sessionKey && entry === `session:${vars.sessionKey}`) scopes.add(entry);
-		if (vars.project && entry === `project:${vars.project}`) scopes.add(entry);
-	}
 	const fallbackScope = resolveDefaultScope(config, vars);
-	if (fallbackScope) scopes.add(fallbackScope);
+	if (fallbackScope && allowed.includes(fallbackScope)) scopes.add(fallbackScope);
+	const workspaceScope = vars.workspace ? `workspace:${vars.workspace}` : "";
+	if (workspaceScope && allowed.includes(workspaceScope)) scopes.add(workspaceScope);
+	const sessionScope = vars.sessionKey ? `session:${vars.sessionKey}` : "";
+	if (sessionScope && allowed.includes(sessionScope)) scopes.add(sessionScope);
+	const projectScope = vars.project ? `project:${vars.project}` : "";
+	if (projectScope && allowed.includes(projectScope)) scopes.add(projectScope);
+	if (fallbackScope === "global" && allowed.includes("global")) scopes.add("global");
 	return [...scopes];
 }
 //#endregion
-export { defaultRetrievalScopes, isScopeAllowed, renderTemplate, resolveDefaultScope };
+export { defaultRetrievalScopes, isScopeAllowed, renderTemplate, resolveDefaultScope, scopeVarsForContext };

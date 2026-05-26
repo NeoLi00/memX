@@ -2251,6 +2251,7 @@ export async function runAbstractionJobs(
   const runStartedAt = nowIso();
   const runId = store.auditRepo.startMaintenance({
     agentId: ctx.agentId,
+    sessionKey: options.batch?.sessionKey ?? ctx.sessionKey,
     jobType: "abstraction-jobs",
     stats: {},
     startedAt: runStartedAt,

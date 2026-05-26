@@ -1,24 +1,24 @@
 import { clamp01, normalizeText, objectRecord, randomId, stableHash, truncateText } from "../support.mjs";
-import { snapshotMemoryLlmBudgetAudit } from "./llmBudgetAudit.mjs";
-import { compileQuery, compileQueryWithoutSemanticFallback } from "./queryCompiler.mjs";
-import { isQuestionLike, queryAnchorSupport } from "./semantic/heuristics.mjs";
 import { projectNamesMatch } from "./projectIdentity.mjs";
-import { isSnapshotFactualStateKey } from "./authority.mjs";
-import { filterBootstrapRows } from "./bootstrapFilter.mjs";
+import { isQuestionLike, queryAnchorSupport } from "./semantic/heuristics.mjs";
 import { semanticTextSimilarity } from "./semantic/textSimilarity.mjs";
-import { capScoreByEvidenceCoverage, evidenceCoverageForText } from "./evidenceCoverage.mjs";
+import { snapshotMemoryLlmBudgetAudit } from "./llmBudgetAudit.mjs";
 import { sourceRefsFromMaintenanceMetadata, uniqueMaintenanceRefs } from "./maintenanceContract.mjs";
+import { filterBootstrapRows } from "./bootstrapFilter.mjs";
 import "./semantics.mjs";
 import { dedupeEvidenceRows, formatFactLine, lineageFromMetadata, normalizeSearchText, rowsFromSearchHits, shouldSuppressRecallText, splitLabelValue, toEvidenceRow } from "./memoryObjectsHelpers.mjs";
+import { isSnapshotFactualStateKey } from "./authority.mjs";
+import { emitContradictionSignals, emitFullRetrievalSignals } from "./signalLedger.mjs";
+import { semanticTaskSummaryText } from "./taskSummary.mjs";
+import { compileQuery, compileQueryWithoutSemanticFallback } from "./queryCompiler.mjs";
+import "./sourceSegments.mjs";
+import { capScoreByEvidenceCoverage, evidenceCoverageForText } from "./evidenceCoverage.mjs";
 import { isAnswerPromptLineRole, normalizeSourceRefs, promptLineRole } from "./sourceRefs.mjs";
 import { candidateGenerationAuditPayload, generateCandidates } from "./candidateGeneration.mjs";
 import { assembleEvidencePackets } from "./evidenceAssembler.mjs";
 import { createMemorySelectionObjective, projectScheduledMemoryObjects } from "./memoryObjectsProjection.mjs";
-import { semanticTaskSummaryText } from "./taskSummary.mjs";
 import { buildBackgroundRecallBundle as buildBackgroundRecallBundle$1, collectAndScheduleMemoryObjectsWithBudget, collectBehavioralGuidance, collectMemoryObjects, queryMemoryFacts, scheduleMemoryObjects, toRouteEvidenceCandidatesFromObjects } from "./memoryObjects.mjs";
 import { buildRecallAuditPayload, compareEvidenceRowsChronologically, sanitizeFocusedRecallQuery } from "./retrieveTracing.mjs";
-import { emitContradictionSignals, emitFullRetrievalSignals } from "./signalLedger.mjs";
-import "./sourceSegments.mjs";
 //#region src/pipeline/retrieve.ts
 const PRIMARY_ROUTE_TYPES = [
 	"workflow",
@@ -46,6 +46,7 @@ function uniqueNonEmpty(values, limit = Number.POSITIVE_INFINITY) {
 	const seen = /* @__PURE__ */ new Set();
 	const ordered = [];
 	for (const value of values) {
+		if (!value) continue;
 		const trimmed = value.trim();
 		if (!trimmed) continue;
 		const normalized = normalizeText(trimmed);
@@ -1945,7 +1946,7 @@ function appendAnchorsToQuery(query, anchors) {
 	const missing = anchors.filter((anchor) => !normalizeText(query).includes(normalizeText(anchor)));
 	return missing.length > 0 ? `${query} ${missing.join(" ")}`.trim() : query;
 }
-function resolveReferentialQueryAnchors(store, ctx, query) {
+function resolveReferentialQueryAnchors(store, ctx, query, queryAnalysis) {
 	const reasons = [];
 	const recentTasks = uniqueTasksById([...store.taskRepo.listRecent({
 		agentId: ctx.agentId,
@@ -1980,7 +1981,7 @@ function resolveReferentialQueryAnchors(store, ctx, query) {
 	const activeTask = activeTasks[0] ?? recentTasks[0];
 	const activeProject = authoritativeActiveProject || (activeTask ? taskProject(activeTask) : "");
 	const anchors = [];
-	if (/(?:前一个项目|上一个项目|previous project|last project)/iu.test(query)) {
+	if (!(queryAnalysis?.contextExclusions ?? []).some((exclusion) => exclusion.kind === "prior_project" || exclusion.kind === "prior_context") && /(?:前一个项目|上一个项目|previous project|last project)/iu.test(query)) {
 		const previousProject = projectMentionSequence[1] ?? projectCandidates.find((candidate) => normalizeText(candidate) !== normalizeText(activeProject)) ?? projectCandidates[1] ?? "";
 		if (previousProject) {
 			anchors.push(previousProject);
@@ -2525,7 +2526,7 @@ async function retrieveEvidence(store, ctx, query, searchQuery = query, auditOpt
 		ctx,
 		reasoner: store.reasoner
 	}) : analyzeRecallQuery(query));
-	const referentResolution = resolveReferentialQueryAnchors(store, ctx, query);
+	const referentResolution = resolveReferentialQueryAnchors(store, ctx, query, queryAnalysis);
 	const retrievalQuery = appendAnchorsToQuery(query, referentResolution.anchors);
 	const retrievalSearchQuery = appendAnchorsToQuery(searchQuery, referentResolution.anchors);
 	const snapshotFocus = queryAnalysis.queryShape.timeframe === "current";
@@ -2981,7 +2982,7 @@ async function retrieveEvidence(store, ctx, query, searchQuery = query, auditOpt
 				selectionReason: entry.selectionReason,
 				text: truncateText(entry.text, 360)
 			})),
-			evidencePackets: bundle.evidencePackets.map((packet) => ({
+			evidencePackets: bundle.evidencePackets.filter((packet) => !packet.dropReason).map((packet) => ({
 				packetId: packet.packetId,
 				slotId: packet.slotId,
 				operationType: packet.operationType,
@@ -3032,6 +3033,29 @@ async function retrieveEvidence(store, ctx, query, searchQuery = query, auditOpt
 				dedupeKey: packet.dedupeKey,
 				coverage: packet.coverage,
 				protectionReason: packet.protectionReason,
+				dropReason: packet.dropReason,
+				primaryText: truncateText(packet.primaryText, 720),
+				supportingTexts: packet.supportingTexts.map((text) => truncateText(text, 360))
+			})),
+			droppedEvidencePackets: bundle.evidencePackets.filter((packet) => packet.dropReason).map((packet) => ({
+				packetId: packet.packetId,
+				slotId: packet.slotId,
+				operationType: packet.operationType,
+				role: packet.role,
+				injected: packet.injected,
+				layers: packet.layers,
+				sourceRefs: packet.sourceRefs,
+				normalizedSourceRefs: packet.normalizedSourceRefs,
+				allSourceRefs: packet.allSourceRefs,
+				normalizedAllSourceRefs: packet.normalizedAllSourceRefs,
+				score: packet.score,
+				scoreBreakdown: packet.scoreBreakdown,
+				displayLines: packet.displayLines,
+				selectionReason: packet.selectionReason,
+				blockedBy: packet.blockedBy,
+				softPenalties: packet.softPenalties,
+				hardExclusions: packet.hardExclusions,
+				coverage: packet.coverage,
 				dropReason: packet.dropReason,
 				primaryText: truncateText(packet.primaryText, 720),
 				supportingTexts: packet.supportingTexts.map((text) => truncateText(text, 360))
@@ -3169,6 +3193,7 @@ async function retrieveEvidence(store, ctx, query, searchQuery = query, auditOpt
 		store.auditRepo.recordRetrieval({
 			auditId,
 			agentId: ctx.agentId,
+			sessionKey: ctx.sessionKey,
 			scope: ctx.scopes.join(","),
 			routeType: bundle.routeType,
 			queryText: query,

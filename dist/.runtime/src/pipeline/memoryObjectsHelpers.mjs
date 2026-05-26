@@ -1,6 +1,6 @@
 import { canonicalStateKey } from "./semantic/heuristics.mjs";
-import { isBootstrapMemoryContamination } from "./bootstrapFilter.mjs";
 import { containsLikelySecret, looksLikePromptInjection } from "../security/injection.mjs";
+import { isBootstrapMemoryContamination } from "./bootstrapFilter.mjs";
 import "./semantics.mjs";
 //#region src/pipeline/memoryObjectsHelpers.ts
 function splitLabelValue(text) {

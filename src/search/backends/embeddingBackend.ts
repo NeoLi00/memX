@@ -1,7 +1,8 @@
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { VectorRepo } from "../../db/repositories/vectorRepo.js";
 import { cosineSimilarity, orderByScore } from "../../support.js";
@@ -21,6 +22,9 @@ type LocalEmbeddingServer = {
   url: string;
   token: string;
   pid?: number;
+  ownerPid?: number;
+  stateFile?: string;
+  workerKey?: string;
 };
 type LocalEmbeddingServerLaunchResponse = LocalEmbeddingServer & {
   error?: string;
@@ -57,9 +61,17 @@ const LOCAL_EMBEDDING_REQUEST_TIMEOUT_MS = 120_000;
 const LOCAL_EMBEDDING_COLD_START_TIMEOUT_MS = 300_000;
 const LOCAL_EMBEDDING_PREWARM_TEXT = "memx local embedding warmup";
 const QUERY_EMBEDDING_CACHE_LIMIT = 128;
+const LOCAL_EMBEDDING_REGISTRY_DIR = join(tmpdir(), "memx-embedder-registry");
+const LEGACY_EMBEDDING_STATE_MAX_AGE_MS = 10 * 60 * 1000;
 const LOCAL_WORKER_PATH = fileURLToPath(
   new URL("../../../sentence_transformers_embedder.py", import.meta.url),
 );
+
+export type LocalEmbeddingWorkerCleanupStats = {
+  checkedStateFiles: number;
+  removedStateFiles: number;
+  stoppedWorkers: number;
+};
 
 async function runCommandWithTimeout(
   commandAndArgs: string[],
@@ -196,6 +208,227 @@ function resolveLocalDevice(config: EmbeddingConfig): string {
   return config.localDevice?.trim() || DEFAULT_LOCAL_DEVICE;
 }
 
+export function localEmbeddingWorkerRegistryDir(): string {
+  return process.env["MEMX_EMBEDDING_WORKER_REGISTRY_DIR"]?.trim() || LOCAL_EMBEDDING_REGISTRY_DIR;
+}
+
+function shortHash(value: string): string {
+  return createHash("sha256").update(value).digest("hex").slice(0, 20);
+}
+
+export function localEmbeddingWorkerStatePath(
+  config: EmbeddingConfig,
+  registryDir = localEmbeddingWorkerRegistryDir(),
+  ownerPid = process.pid,
+): string {
+  return join(registryDir, `memx-embedder-${shortHash(localWorkerPoolKey(config))}-${ownerPid}.json`);
+}
+
+function parseWorkerState(value: string): LocalEmbeddingServer | null {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!parsed || typeof parsed !== "object") {
+      return null;
+    }
+    const record = parsed as Record<string, unknown>;
+    const url = typeof record.url === "string" ? record.url.trim() : "";
+    const token = typeof record.token === "string" ? record.token.trim() : "";
+    const pid = typeof record.pid === "number" && Number.isInteger(record.pid) ? record.pid : undefined;
+    const ownerPid =
+      typeof record.ownerPid === "number" && Number.isInteger(record.ownerPid)
+        ? record.ownerPid
+        : typeof record.parentPid === "number" && Number.isInteger(record.parentPid)
+          ? record.parentPid
+          : undefined;
+    if (!url || !token) {
+      return null;
+    }
+    return {
+      url: url.replace(/\/$/, ""),
+      token,
+      pid,
+      ownerPid,
+      workerKey: typeof record.workerKey === "string" ? record.workerKey : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function readWorkerStateFile(path: string): Promise<LocalEmbeddingServer | null> {
+  try {
+    const state = parseWorkerState(await readFile(path, "utf8"));
+    return state ? { ...state, stateFile: path } : null;
+  } catch {
+    return null;
+  }
+}
+
+async function requestWorkerShutdown(server: LocalEmbeddingServer): Promise<boolean> {
+  if (!server.url || !server.token) {
+    return false;
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 1500);
+  try {
+    await fetch(`${server.url}/shutdown`, {
+      method: "POST",
+      headers: { "x-memx-token": server.token },
+      signal: controller.signal,
+    });
+    return true;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function removeWorkerStateFile(path: string): Promise<boolean> {
+  try {
+    await rm(path, { force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function listWorkerStateFiles(dir: string): Promise<string[]> {
+  try {
+    const entries = await readdir(dir);
+    return entries
+      .filter((entry) => entry.startsWith("memx-embedder-") && entry.endsWith(".json"))
+      .map((entry) => join(dir, entry));
+  } catch {
+    return [];
+  }
+}
+
+async function stateFileAgeMs(path: string): Promise<number> {
+  try {
+    const info = await stat(path);
+    return Math.max(0, Date.now() - info.mtimeMs);
+  } catch {
+    return Number.POSITIVE_INFINITY;
+  }
+}
+
+function legacyWorkerStateDirs(registryDir: string, explicitDirs?: string[]): string[] {
+  const candidates = explicitDirs ?? [tmpdir()];
+  return [...new Set(candidates.filter((dir) => dir && dir !== registryDir))];
+}
+
+type CleanupWorkerStateMode = "registry" | "legacy";
+
+async function cleanupWorkerStateFile(params: {
+  path: string;
+  mode: CleanupWorkerStateMode;
+  currentPid: number;
+  legacyStateMaxAgeMs: number;
+  stats: LocalEmbeddingWorkerCleanupStats;
+}): Promise<void> {
+  params.stats.checkedStateFiles += 1;
+  const state = await readWorkerStateFile(params.path);
+  if (!state) {
+    if (await removeWorkerStateFile(params.path)) {
+      params.stats.removedStateFiles += 1;
+    }
+    return;
+  }
+
+  const ownerPid = state.ownerPid;
+  const ownerAlive = ownerPid ? isProcessAlive(ownerPid) : false;
+  const workerAlive = isProcessAlive(state.pid);
+  const legacyFreshEnough =
+    params.mode === "legacy" &&
+    !ownerPid &&
+    (await stateFileAgeMs(params.path)) < params.legacyStateMaxAgeMs;
+  if (params.mode === "legacy" && !state.pid && !ownerPid) {
+    if (legacyFreshEnough) {
+      return;
+    }
+    if (await removeWorkerStateFile(params.path)) {
+      params.stats.removedStateFiles += 1;
+    }
+    return;
+  }
+
+  if (!workerAlive) {
+    if (await removeWorkerStateFile(params.path)) {
+      params.stats.removedStateFiles += 1;
+    }
+    return;
+  }
+  if (ownerPid === params.currentPid || ownerAlive || legacyFreshEnough) {
+    return;
+  }
+  const shutdownRequested = await requestWorkerShutdown(state);
+  if (state.pid && !(await waitForProcessExit(state.pid, 1500)) && isProcessAlive(state.pid)) {
+    killProcessBestEffort(state.pid, "SIGTERM");
+    if (!(await waitForProcessExit(state.pid, 1000)) && isProcessAlive(state.pid)) {
+      killProcessBestEffort(state.pid, "SIGKILL");
+    }
+  }
+  if (shutdownRequested) {
+    params.stats.stoppedWorkers += 1;
+  }
+  if (await removeWorkerStateFile(params.path)) {
+    params.stats.removedStateFiles += 1;
+  }
+}
+
+export async function cleanupStaleLocalEmbeddingWorkers(params: {
+  registryDir?: string;
+  logger?: MemxLogger;
+  currentPid?: number;
+  legacyStateDirs?: string[];
+  legacyStateMaxAgeMs?: number;
+} = {}): Promise<LocalEmbeddingWorkerCleanupStats> {
+  const registryDir = params.registryDir ?? localEmbeddingWorkerRegistryDir();
+  const currentPid = params.currentPid ?? process.pid;
+  const legacyStateMaxAgeMs = Math.max(
+    0,
+    params.legacyStateMaxAgeMs ?? LEGACY_EMBEDDING_STATE_MAX_AGE_MS,
+  );
+  const stats: LocalEmbeddingWorkerCleanupStats = {
+    checkedStateFiles: 0,
+    removedStateFiles: 0,
+    stoppedWorkers: 0,
+  };
+  const registryFiles = await listWorkerStateFiles(registryDir);
+  const legacyFiles = (
+    await Promise.all(
+      legacyWorkerStateDirs(registryDir, params.legacyStateDirs).map((dir) =>
+        listWorkerStateFiles(dir),
+      ),
+    )
+  ).flat();
+  const fileModes = new Map<string, CleanupWorkerStateMode>();
+  for (const path of legacyFiles) {
+    fileModes.set(path, "legacy");
+  }
+  for (const path of registryFiles) {
+    fileModes.set(path, "registry");
+  }
+  await Promise.all(
+    [...fileModes.entries()].map(async ([path, mode]) => {
+      await cleanupWorkerStateFile({
+        path,
+        mode,
+        currentPid,
+        legacyStateMaxAgeMs,
+        stats,
+      });
+    }),
+  );
+  if (stats.removedStateFiles > 0 || stats.stoppedWorkers > 0) {
+    params.logger?.debug?.(
+      `memx: cleaned stale local embedding workers stateFiles=${stats.removedStateFiles} stopped=${stats.stoppedWorkers}`,
+    );
+  }
+  return stats;
+}
+
 class LocalSentenceTransformerWorker {
   private hasCompletedRequest = false;
   private closed = false;
@@ -252,7 +485,12 @@ class LocalSentenceTransformerWorker {
 
   private async launchServer(timeoutMs: number): Promise<LocalEmbeddingServer> {
     const token = randomUUID();
-    const stateFile = join(tmpdir(), `memx-embedder-${token}.json`);
+    const registryDir = localEmbeddingWorkerRegistryDir();
+    await cleanupStaleLocalEmbeddingWorkers({ registryDir, logger: this.logger });
+    const stateFile = localEmbeddingWorkerStatePath(this.config, registryDir);
+    await mkdir(dirname(stateFile), { recursive: true });
+    await rm(stateFile, { force: true });
+    const workerKey = localWorkerPoolKey(this.config);
     const args = [
       LOCAL_WORKER_PATH,
       "--launch-server",
@@ -315,7 +553,23 @@ class LocalSentenceTransformerWorker {
         "local sentence-transformers server launcher returned invalid metadata",
       );
     }
-    return { url: response.url.replace(/\/$/, ""), token: response.token, pid: response.pid };
+    const server = {
+      url: response.url.replace(/\/$/, ""),
+      token: response.token,
+      pid: response.pid,
+      ownerPid: process.pid,
+      stateFile,
+      workerKey,
+    };
+    await writeFile(
+      stateFile,
+      `${JSON.stringify({
+        ...server,
+        updatedAt: new Date().toISOString(),
+      })}\n`,
+      "utf8",
+    );
+    return server;
   }
 
   private async requestEmbedding(
@@ -407,6 +661,9 @@ class LocalSentenceTransformerWorker {
           killProcessBestEffort(server.pid, "SIGKILL");
         }
       }
+    }
+    if (server.stateFile) {
+      await removeWorkerStateFile(server.stateFile);
     }
   }
 }

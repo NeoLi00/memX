@@ -17,6 +17,7 @@ import type {
   MemoryPrimaryRouteType,
   QueryAnswerMode,
   QueryCompileResult,
+  QueryContextExclusion,
   QueryEntityHint,
   QueryEntityRole,
   QuerySuppressedEntityHint,
@@ -30,6 +31,13 @@ import type {
   TurnMode,
 } from "../types.js";
 import { MEMX_NATIVE_HOOK_TIMEOUT_MS } from "../timeouts.js";
+import {
+  attributeSlotAliasesForSlots,
+  attributeSlotContractHints,
+  queryAsksForAttributeValue,
+  requestedAttributeSlotsFromText,
+} from "./attributeSlots.js";
+import { entityNameAliases } from "./entityAliases.js";
 import { recordMemoryLlmBudgetCall } from "./llmBudgetAudit.js";
 
 const QUERY_ENVELOPE_LONG_THRESHOLD_CHARS = 2400;
@@ -584,6 +592,57 @@ function sanitizeSuppressedEntities(value: unknown, limit = 8): QuerySuppressedE
   return entities;
 }
 
+const VALID_CONTEXT_EXCLUSION_KINDS = new Set<QueryContextExclusion["kind"]>([
+  "prior_project",
+  "prior_topic",
+  "prior_context",
+  "host_native_memory",
+]);
+
+function sanitizeContextExclusionKind(value: unknown): QueryContextExclusion["kind"] | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const normalized = value.trim();
+  return VALID_CONTEXT_EXCLUSION_KINDS.has(normalized as QueryContextExclusion["kind"])
+    ? (normalized as QueryContextExclusion["kind"])
+    : undefined;
+}
+
+function sanitizeContextExclusions(value: unknown, limit = 8): QueryContextExclusion[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const seen = new Set<string>();
+  const exclusions: QueryContextExclusion[] = [];
+  for (const entry of value) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      continue;
+    }
+    const record = entry as Record<string, unknown>;
+    const kind = sanitizeContextExclusionKind(record.kind);
+    const label = typeof record.label === "string" ? truncateText(record.label.trim(), 160) : "";
+    if (!kind || !label) {
+      continue;
+    }
+    const key = `${kind}:${normalizeName(label)}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    const reason = typeof record.reason === "string" ? truncateText(record.reason.trim(), 160) : "";
+    exclusions.push({
+      kind,
+      label,
+      ...(reason ? { reason } : {}),
+    });
+    if (exclusions.length >= limit) {
+      break;
+    }
+  }
+  return exclusions;
+}
+
 
 function computeTurnMode(query: string, queryShape: RecallQueryShape): TurnMode {
   if (
@@ -769,6 +828,10 @@ function uniqueNonEmpty(values: string[], limit = 8): string[] {
   return result;
 }
 
+function queryEntitySubjectHints(queryEntities: QueryEntityHint[], limit = 8): string[] {
+  return uniqueNonEmpty(queryEntities.flatMap((entity) => entityNameAliases(entity.name)), limit);
+}
+
 function normalizeCompilerHint(value: string): string {
   const cleaned = value.replace(/\s+/gu, " ").trim();
   const normalized = normalizeText(cleaned);
@@ -800,10 +863,32 @@ function meaningfulQueryTerms(query: string): string[] {
   return uniqueNonEmpty([normalizeCompilerHint(query)].filter(usefulQueryHint), 8);
 }
 
+function querySuggestsMultipleAnswerValues(query: string): boolean {
+  const normalized = query.normalize("NFKC").toLowerCase();
+  const delimiterMatches = normalized.match(/(?:、|，|,|\/|\b(?:and|plus)\b|和|与|以及)/giu) ?? [];
+  const explicitlyDistributed =
+    /(?:分别|各自|分别是|各是什么|respectively|each|both|all of|list|列出)/iu.test(normalized);
+  const asksForValue =
+    /(?:什么|哪些|哪几个|是什么|what|which|where|when|how many|value|values)/iu.test(normalized);
+  return (explicitlyDistributed && delimiterMatches.length >= 1) || (asksForValue && delimiterMatches.length >= 2);
+}
+
 function deriveAnswerMode(query: string, queryShape: RecallQueryShape): QueryAnswerMode {
-  void query;
+  const requestedSlots = requestedAttributeSlotsFromText(query);
+  if (queryAsksForAttributeValue(query) && requestedSlots.length > 1) {
+    return "multi_evidence";
+  }
+  if (querySuggestsMultipleAnswerValues(query)) {
+    return "multi_evidence";
+  }
   if (queryShape.timeframe === "compare" || queryShape.evidenceNeed === "relation") {
     return "multi_evidence";
+  }
+  if (
+    queryAsksForAttributeValue(query) &&
+    requestedSlots.length === 1
+  ) {
+    return "attribute_lookup";
   }
   return "single_fact";
 }
@@ -813,7 +898,12 @@ function sanitizeAnswerMode(
   query: string,
   queryShape: RecallQueryShape,
 ): QueryAnswerMode {
-  void query;
+  if (
+    querySuggestsMultipleAnswerValues(query) &&
+    (value === "single_fact" || value === "attribute_lookup" || value === undefined)
+  ) {
+    return "multi_evidence";
+  }
   return value === "single_fact" ||
     value === "attribute_lookup" ||
     value === "count_aggregate" ||
@@ -1132,6 +1222,7 @@ function slotFromHints(params: {
   description: string;
   subjectHints: string[];
   relationHints: string[];
+  requestedAttributeSlots?: string[];
   capabilityQueries?: string[];
   negativeHints?: string[];
   requiredFields: string[];
@@ -1148,6 +1239,7 @@ function slotFromHints(params: {
       params.relationHints.map(normalizeCompilerHint).filter(Boolean),
       6,
     ),
+    requestedAttributeSlots: uniqueNonEmpty(params.requestedAttributeSlots ?? [], 6),
     capabilityQueries: uniqueNonEmpty(
       (params.capabilityQueries ?? []).map(normalizeCompilerHint).filter(Boolean),
       8,
@@ -1162,6 +1254,112 @@ function slotFromHints(params: {
     fallbackLayers: params.fallbackLayers,
     minEvidence: Math.max(1, Math.min(4, Math.trunc(params.minEvidence))),
   };
+}
+
+const ATTRIBUTE_QUERY_ENGLISH_STOP_WORDS = new Set([
+  "a",
+  "an",
+  "and",
+  "are",
+  "current",
+  "default",
+  "for",
+  "is",
+  "of",
+  "the",
+  "what",
+  "which",
+  "with",
+]);
+
+const ATTRIBUTE_QUERY_ENGLISH_LEADING_RE =
+  /^(?:what|which|who|where|when|how|is|are|was|were|does|do|did|can|could|please|tell\s+me|show\s+me)\b[\s,.:;!?-]*/iu;
+
+const ATTRIBUTE_QUERY_CJK_NOISE_RE =
+  /(?:现在|当前|目前|请问|帮我|告诉我|是什么|是哪一个|哪一个|哪种|哪些|什么|用什么|使用什么|默认|主要|主|的|是|为|请|一下)+$/u;
+
+function cleanAttributeSubjectCandidate(value: string): string {
+  let cleaned = value
+    .normalize("NFKC")
+    .replace(/[“”"'\u2018\u2019`]/gu, "")
+    .replace(/\b([A-Za-z0-9_.-]+)'s\b/giu, "$1")
+    .replace(/[?？!！,，、;；:：()[\]{}<>]/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim();
+  while (ATTRIBUTE_QUERY_ENGLISH_LEADING_RE.test(cleaned)) {
+    cleaned = cleaned.replace(ATTRIBUTE_QUERY_ENGLISH_LEADING_RE, "").trim();
+  }
+  cleaned = cleaned.replace(ATTRIBUTE_QUERY_CJK_NOISE_RE, "").trim();
+  const tokens = cleaned.split(/\s+/u).filter(Boolean);
+  const filteredTokens = tokens.filter((token) => {
+    const normalized = normalizeText(token);
+    return normalized && !ATTRIBUTE_QUERY_ENGLISH_STOP_WORDS.has(normalized);
+  });
+  cleaned = filteredTokens.join(" ").trim() || cleaned;
+  return cleaned
+    .replace(/\s+(?:and|or)$/iu, "")
+    .replace(/(?:和|与|以及)$/u, "")
+    .trim();
+}
+
+function codeLikeQueryEntityHints(query: string): string[] {
+  const stopWords = new Set([
+    "A",
+    "An",
+    "And",
+    "Are",
+    "Current",
+    "Default",
+    "For",
+    "Is",
+    "Of",
+    "The",
+    "What",
+    "Which",
+  ]);
+  const matches = [
+    ...query.matchAll(/[`"'“”‘’]([^`"'“”‘’]{2,80})[`"'“”‘’]/gu),
+    ...query.matchAll(/\b[A-Z][A-Za-z0-9]*(?:[._/-][A-Za-z0-9]+)*(?:[A-Z][A-Za-z0-9]*)*\b/gu),
+  ];
+  return uniqueNonEmpty(
+    matches
+      .map((match) => (match[1] ?? match[0]).replace(/'s$/iu, "").trim())
+      .filter((entry) => entry.length >= 2 && !stopWords.has(entry)),
+    6,
+  );
+}
+
+function attributeQuerySubjectHints(query: string, requestedSlots: string[]): string[] {
+  if (requestedSlots.length === 0) {
+    return [];
+  }
+  const aliases = attributeSlotAliasesForSlots(requestedSlots);
+  const lowerQuery = query.normalize("NFKC").toLowerCase();
+  let earliest = Number.POSITIVE_INFINITY;
+  for (const alias of aliases) {
+    const normalizedAlias = alias.normalize("NFKC").toLowerCase();
+    const index = lowerQuery.indexOf(normalizedAlias);
+    if (index >= 0) {
+      earliest = Math.min(earliest, index);
+    }
+  }
+  const prefix =
+    Number.isFinite(earliest) && earliest > 0 ? query.slice(0, earliest) : query;
+  const cleanedPrefix = cleanAttributeSubjectCandidate(prefix);
+  const codeLikeHints = codeLikeQueryEntityHints(query);
+  return uniqueNonEmpty(
+    [
+      ...codeLikeHints,
+      cleanedPrefix,
+    ].filter((hint) => {
+      const normalized = normalizeText(hint);
+      if (!normalized || requestedAttributeSlotsFromText(hint).length > 0) {
+        return false;
+      }
+      return normalizedTerms(normalized, { minLength: 2 }).length > 0 || /[\p{Script=Han}]/u.test(hint);
+    }),
+    6,
+  );
 }
 
 function buildDefaultEvidencePlan(params: {
@@ -1183,17 +1381,28 @@ function buildDefaultEvidencePlan(params: {
     queryShape: params.queryShape,
     answerMode: params.answerMode,
   });
+  const requestedAttributeSlots = requestedAttributeSlotsFromText(
+    params.query,
+    params.focusedQuery,
+  );
+  const requestedAttributeHints = attributeSlotContractHints(requestedAttributeSlots);
+  const attributeSubjectHints = attributeQuerySubjectHints(params.query, requestedAttributeSlots);
   const relationHints: string[] = [];
   const comparisonAnchors =
     params.queryShape.timeframe === "compare"
       ? splitComparisonAnchors(params.query, params.anchors)
       : [];
   const topicHints = uniqueNonEmpty(
-    [
-      ...params.anchors,
-      ...meaningfulQueryTerms(params.focusedQuery || params.query),
-      ...meaningfulQueryTerms(params.query),
-    ],
+    attributeSubjectHints.length > 0
+      ? [
+          ...attributeSubjectHints,
+          ...params.anchors,
+        ]
+      : [
+          ...params.anchors,
+          ...meaningfulQueryTerms(params.focusedQuery || params.query),
+          ...meaningfulQueryTerms(params.query),
+        ],
     6,
   );
   const slots =
@@ -1239,6 +1448,40 @@ function buildDefaultEvidencePlan(params: {
               minEvidence: 1,
             }),
           ]
+        : requestedAttributeSlots.length > 1
+          ? [
+              slotFromHints({
+                id: "query_context",
+                role: "query_context",
+                requiredRole: "query_context",
+                description: "Subject or situation the requested attributes belong to.",
+                subjectHints: topicHints,
+                relationHints: ["query subject", "lookup context"],
+                requiredFields: ["query_context"],
+                preferredLayers,
+                fallbackLayers,
+                minEvidence: 1,
+              }),
+              ...requestedAttributeSlots.map((slot) =>
+                slotFromHints({
+                  id: `answer_${slot}`.slice(0, 48),
+                  role: "answer_value",
+                  requiredRole: "answer_value",
+                  description: `The ${slot.replace(/_/g, " ")} value that directly answers: ${params.focusedQuery || params.query}`,
+                  subjectHints: topicHints,
+                  relationHints: [
+                    "requested attribute value",
+                    "direct answer value",
+                    ...attributeSlotContractHints([slot]),
+                  ],
+                  requestedAttributeSlots: [slot],
+                  requiredFields: ["attribute_value", slot],
+                  preferredLayers,
+                  fallbackLayers,
+                  minEvidence: 1,
+                }),
+              ),
+            ]
         : params.answerMode === "attribute_lookup"
           ? [
               slotFromHints({
@@ -1259,8 +1502,16 @@ function buildDefaultEvidencePlan(params: {
                 requiredRole: "answer_value",
                 description: `The attribute value that directly answers: ${params.focusedQuery || params.query}`,
                 subjectHints: topicHints,
-                relationHints: ["requested attribute value", "direct answer value"],
-                requiredFields: ["attribute_value"],
+                relationHints: [
+                  "requested attribute value",
+                  "direct answer value",
+                  ...requestedAttributeHints,
+                ],
+                requestedAttributeSlots,
+                requiredFields: [
+                  "attribute_value",
+                  ...requestedAttributeSlots,
+                ],
                 preferredLayers,
                 fallbackLayers,
                 minEvidence: 1,
@@ -1324,8 +1575,15 @@ function buildDefaultEvidencePlan(params: {
                   requiredRole: "answer_value",
                   description: `Evidence that can directly answer: ${params.focusedQuery || params.query}`,
                   subjectHints: topicHints,
-                  relationHints,
-                  requiredFields: requiredFields.length > 0 ? requiredFields : ["answer_value"],
+                  relationHints: [...relationHints, ...requestedAttributeHints],
+                  requestedAttributeSlots,
+                  requiredFields:
+                    requiredFields.length > 0 || requestedAttributeSlots.length > 0
+                      ? [
+                          ...requiredFields,
+                          ...requestedAttributeSlots,
+                        ]
+                      : ["answer_value"],
                   preferredLayers,
                   fallbackLayers,
                   minEvidence: 1,
@@ -1590,6 +1848,10 @@ function ensureTailorAdviceSlots(
         [...(existing.relationHints ?? []), ...(slot.relationHints ?? [])],
         10,
       ),
+      requestedAttributeSlots: uniqueNonEmpty(
+        [...(existing.requestedAttributeSlots ?? []), ...(slot.requestedAttributeSlots ?? [])],
+        8,
+      ),
       capabilityQueries: uniqueNonEmpty(
         [...(existing.capabilityQueries ?? []), ...(slot.capabilityQueries ?? [])],
         10,
@@ -1784,6 +2046,17 @@ function sanitizeEvidencePlan(
         [...compiledRelationHints, ...(fallbackSlot.relationHints ?? [])],
         relationHintLimit,
       );
+      const requestedAttributeSlots = uniqueNonEmpty(
+        [
+          ...requestedAttributeSlotsFromText(
+            description,
+            ...relationHints,
+            ...sanitizeSlotTextArray(entry.requiredFields, fallbackSlot.requiredFields, 8),
+          ),
+          ...(fallbackSlot.requestedAttributeSlots ?? []),
+        ],
+        8,
+      );
       const capabilityQueries = uniqueNonEmpty(
         [
           ...sanitizeSlotTextArray(
@@ -1831,6 +2104,7 @@ function sanitizeEvidencePlan(
         description,
         subjectHints: subjectHints.length > 0 ? subjectHints : fallbackSlot.subjectHints,
         relationHints,
+        requestedAttributeSlots,
         capabilityQueries,
         negativeHints,
         requiredFields,
@@ -1864,6 +2138,30 @@ function sanitizeEvidencePlan(
     fallbackPlan,
   );
   return ensureTailorAdviceSlots(sanitizedPlan, fallback);
+}
+
+function applyQueryEntitySubjectHints(
+  plan: QueryEvidencePlan,
+  queryEntities: QueryEntityHint[],
+  queryText: string,
+): QueryEvidencePlan {
+  const entityHints = queryEntitySubjectHints(queryEntities, 8);
+  if (entityHints.length === 0) {
+    return plan;
+  }
+  const normalizedQuery = normalizeText(queryText);
+  return {
+    ...plan,
+    slots: plan.slots.map((slot) => {
+      const existing = (slot.subjectHints ?? []).filter(
+        (hint) => normalizeText(hint) !== normalizedQuery,
+      );
+      return {
+        ...slot,
+        subjectHints: uniqueNonEmpty([...entityHints, ...existing], 8),
+      };
+    }),
+  };
 }
 
 function semanticBridgeShapeForRole(
@@ -2088,6 +2386,9 @@ function applyQueryCompileGuards(query: string, compiled: QueryCompileResult): Q
   guarded.shouldRecall = true;
   guarded.queryEntities = sanitizeQueryEntities(compiled.queryEntities);
   guarded.suppressedEntities = sanitizeSuppressedEntities(compiled.suppressedEntities);
+  guarded.contextExclusions = sanitizeContextExclusions(
+    (compiled as Partial<QueryCompileResult> & { contextExclusions?: unknown }).contextExclusions,
+  );
   guarded.primaryRoute =
     sanitizePrimaryRoute(compiled.primaryRoute) ?? primaryRouteFromWeights(compiled.routeWeights);
   guarded.answerMode = compiled.answerMode
@@ -2203,29 +2504,45 @@ export function compileQueryWithoutSemanticFallback(
   reason = "llm-only-query-compiler-unavailable",
 ): QueryCompileResult {
   const focusedQuery = buildTaskBearingFocusedQuery(query);
+  const requestedAttributeSlots = requestedAttributeSlotsFromText(query);
+  const attributeLookupFallback =
+    queryAsksForAttributeValue(query) && requestedAttributeSlots.length > 0;
   const queryShape: RecallQueryShape = {
-    timeframe: "timeless",
-    granularity: "summary",
+    timeframe: attributeLookupFallback ? "current" : "timeless",
+    granularity: attributeLookupFallback ? "exact_detail" : "summary",
     referentialMode: "anchored",
-    evidenceNeed: "chunk",
+    evidenceNeed: attributeLookupFallback ? "canonical_state" : "chunk",
   };
   const answerGranularity = deriveAnswerGranularity(queryShape);
   const evidenceFidelity = deriveEvidenceFidelity(queryShape, []);
   const routeWeights = deriveRouteWeights(queryShape);
+  const answerMode = deriveAnswerMode(query, queryShape);
+  const candidateSurfaces = deriveCandidateSurfaces(queryShape, answerGranularity, evidenceFidelity);
+  const evidencePlan = buildDefaultEvidencePlan({
+    query,
+    focusedQuery,
+    queryShape,
+    anchors: [],
+    candidateSurfaces,
+    answerMode,
+  });
   return {
     queryText: query,
     shouldRecall: true,
     focusedQuery,
     queryEntities: [],
     suppressedEntities: [],
+    contextExclusions: [],
     queryShape,
     primaryRoute: primaryRouteFromWeights(routeWeights),
     answerGranularity,
     evidenceFidelity,
     routeWeights,
     anchors: [],
-    candidateSurfaces: deriveCandidateSurfaces(queryShape, answerGranularity, evidenceFidelity),
+    candidateSurfaces,
     evidenceGoals: [],
+    evidencePlan,
+    answerMode,
     detailNeedScore: 0,
     supportNeed: 0,
     ambiguityLevel: 0,
@@ -2262,13 +2579,18 @@ function mergeCompiledQuery(
     typeof safeCompiled.focusedQuery === "string" && safeCompiled.focusedQuery.trim()
       ? protectFocusedQuery(fallback.queryText, safeCompiled.focusedQuery)
       : fallback.focusedQuery;
-  const anchors = safeCompiled.anchors ? safeCompiled.anchors : fallback.anchors;
+  const rawAnchors = safeCompiled.anchors ? safeCompiled.anchors : fallback.anchors;
   const queryEntities = sanitizeQueryEntities(
     (safeCompiled as Partial<QueryCompileResult> & { queryEntities?: unknown }).queryEntities,
   );
+  const anchors = uniqueNonEmpty([...queryEntitySubjectHints(queryEntities, 8), ...rawAnchors], 8);
   const suppressedEntities = sanitizeSuppressedEntities(
     (safeCompiled as Partial<QueryCompileResult> & { suppressedEntities?: unknown })
       .suppressedEntities,
+  );
+  const contextExclusions = sanitizeContextExclusions(
+    (safeCompiled as Partial<QueryCompileResult> & { contextExclusions?: unknown })
+      .contextExclusions,
   );
   const primaryRoute =
     sanitizePrimaryRoute(
@@ -2286,9 +2608,10 @@ function mergeCompiledQuery(
   if (queryEntities.length > 0) {
     derivedSurfaces.push("entity_alias", "graph");
   }
-  const candidateSurfaces = sanitizeCandidateSurfaces(safeCompiled.candidateSurfaces, [
+  const sanitizedCandidateSurfaces = sanitizeCandidateSurfaces(safeCompiled.candidateSurfaces, [
     ...new Set(derivedSurfaces),
   ]);
+  const candidateSurfaces = [...new Set([...sanitizedCandidateSurfaces, ...derivedSurfaces])];
   const sanitizerFallback: QueryCompileResult = {
     ...fallback,
     ...safeCompiled,
@@ -2297,6 +2620,7 @@ function mergeCompiledQuery(
     focusedQuery,
     queryEntities,
     suppressedEntities,
+    contextExclusions,
     queryShape,
     primaryRoute,
     answerGranularity,
@@ -2306,11 +2630,14 @@ function mergeCompiledQuery(
     routeWeights,
     compilerProvenance,
   };
-  const sanitizedPlan = safeCompiled.evidencePlan
+  const rawSanitizedPlan = safeCompiled.evidencePlan
     ? sanitizeEvidencePlan(sanitizerFallback, safeCompiled.evidencePlan)
     : hasLlmSemanticContract
       ? sanitizeEvidencePlan(sanitizerFallback, undefined)
       : undefined;
+  const sanitizedPlan = rawSanitizedPlan
+    ? applyQueryEntitySubjectHints(rawSanitizedPlan, queryEntities, fallback.queryText)
+    : undefined;
   const bridgeFallback: QueryCompileResult = {
     ...sanitizerFallback,
     evidencePlan: sanitizedPlan,
@@ -2343,6 +2670,7 @@ function mergeCompiledQuery(
     focusedQuery,
     queryEntities,
     suppressedEntities,
+    contextExclusions,
     queryShape,
     primaryRoute,
     answerGranularity,

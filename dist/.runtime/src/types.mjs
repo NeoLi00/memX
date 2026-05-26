@@ -11,6 +11,7 @@ const ENTITY_TYPES = [
 ];
 const MEMORY_SCOPE_TEMPLATES = [
 	"global",
+	"workspace:{workspace}",
 	"agent:{agentId}",
 	"session:{sessionKey}",
 	"project:{project}"

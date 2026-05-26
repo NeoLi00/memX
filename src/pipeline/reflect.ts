@@ -1,4 +1,4 @@
-import { resolveDefaultScope } from "../security/scopes.js";
+import { resolveDefaultScope, scopeVarsForContext } from "../security/scopes.js";
 import { normalizeText } from "../support.js";
 import type { ClassifiedCandidate, MemoryCandidate, MemoryOperationContext } from "../types.js";
 import { classifyAction } from "./classify.js";
@@ -35,12 +35,7 @@ async function reflectCandidatesInternal(
         ...policyResult.candidate,
         normalizedText: normalizeText(trimmed),
         policy: policyResult.decision,
-        scope: resolveDefaultScope(ctx.config, {
-          agentId: ctx.agentId,
-          sessionKey: ctx.sessionKey,
-          project: ctx.project,
-          workspace: ctx.workspaceDir,
-        }),
+        scope: resolveDefaultScope(ctx.config, scopeVarsForContext(ctx)),
         classification: classifyAction(policyResult.decision.action),
         confidence: 0,
       };

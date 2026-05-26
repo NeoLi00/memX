@@ -14,6 +14,12 @@ import type {
   QuerySemanticBridge,
 } from "../types.js";
 import type { CandidateGenerationResult } from "./candidateGeneration.js";
+import {
+  attributeSlotFromPredicate,
+  canonicalAttributeSlot,
+  predicateMatchesAttributeSlots,
+  requestedAttributeSlotsFromText,
+} from "./attributeSlots.js";
 import { looksLikeBareMemoryUseInstruction } from "./semantic/heuristics.js";
 import { semanticTextSimilarity } from "./semantic/textSimilarity.js";
 import { normalizeSourceRefs, promptLineRole } from "./sourceRefs.js";
@@ -170,6 +176,20 @@ function bindingSourceRefsForEntry(entry: PromptEvidenceCandidate): string[] {
     return [metadataLineage.sourceRef];
   }
   return [...new Set((entry.mergedSourceRefs ?? []).filter(Boolean))];
+}
+
+function entriesShareBindingSourceIdentity(
+  left: PromptEvidenceCandidate,
+  right: PromptEvidenceCandidate,
+): boolean {
+  const leftRefs = bindingSourceRefsForEntry(left);
+  const rightRefs = bindingSourceRefsForEntry(right);
+  if (leftRefs.length > 0 && rightRefs.length > 0) {
+    return leftRefs.some((sourceRef) => rightRefs.includes(sourceRef));
+  }
+  const leftAllRefs = sourceRefsForEntry(left);
+  const rightAllRefs = sourceRefsForEntry(right);
+  return leftAllRefs.some((sourceRef) => rightAllRefs.includes(sourceRef));
 }
 
 function sourceFamilyRef(sourceRef: string): string {
@@ -447,14 +467,53 @@ function unitHasAnswerRole(unit: EvidenceUnit): boolean {
   );
 }
 
+function queryAllowsAssistantAuthoredAnswer(queryAnalysis: QueryCompileResult): boolean {
+  const slots = queryAnalysis.evidencePlan?.slots ?? [];
+  const adviceOrResourceMode =
+    operationType(queryAnalysis) === "tailor_advice" ||
+    slots.some(
+      (slot) =>
+        slot.role === "prior_advice" ||
+        slot.requiredRole === "prior_advice" ||
+        slot.role === "user_resource" ||
+        slot.requiredRole === "user_resource",
+    );
+  if (adviceOrResourceMode) {
+    return true;
+  }
+  if (
+    queryAnalysis.answerMode === "attribute_lookup" ||
+    queryAnalysis.queryShape.evidenceNeed === "canonical_state"
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function unitLooksLikeAssistantNonAnswer(unit: EvidenceUnit): boolean {
+  if (unit.authorRole !== "assistant") {
+    return false;
+  }
+  const text = `${unit.rawText || ""}\n${unit.displayText || ""}`;
+  return /(?:\b(?:i\s+do\s+not|i\s+don't|cannot|can't)\s+(?:know|answer)\b|\bno\s+(?:information|record|memory)\b|无法(?:回答|确定)|不知道|不清楚|没有(?:关于|相关)?.{0,24}(?:信息|记录|记忆)|未(?:找到|记录)|需要(?:你)?提供.{0,24}(?:文件|路径|信息))/iu.test(
+    text,
+  );
+}
+
 function unitLooksLikeAnswer(queryAnalysis: QueryCompileResult, unit: EvidenceUnit): boolean {
+  if (unitLooksLikeAssistantNonAnswer(unit)) {
+    return false;
+  }
   if (unitIsQuestionLike(queryAnalysis, unit) && !unit.roles.includes("user_resource")) {
+    return false;
+  }
+  if (unit.authorRole === "assistant" && !queryAllowsAssistantAuthoredAnswer(queryAnalysis)) {
     return false;
   }
   if (unitHasAnswerRole(unit)) {
     return true;
   }
-  if (unit.authorRole === "assistant") {
+  if (unit.authorRole === "assistant" && queryAllowsAssistantAuthoredAnswer(queryAnalysis)) {
     return true;
   }
   return (
@@ -463,6 +522,17 @@ function unitLooksLikeAnswer(queryAnalysis: QueryCompileResult, unit: EvidenceUn
     unit.origin === "raw_chunk" ||
     unit.origin === "snippet"
   );
+}
+
+function answerUnitsForMode(
+  queryAnalysis: QueryCompileResult,
+  units: EvidenceUnit[],
+): EvidenceUnit[] {
+  if (queryAnalysis.answerMode !== "multi_evidence") {
+    return units;
+  }
+  const canonicalFacts = units.filter((unit) => unit.origin === "canonical_fact");
+  return canonicalFacts.length >= 2 ? canonicalFacts : units;
 }
 
 function refsForUnit(unit: EvidenceUnit): string[] {
@@ -579,10 +649,13 @@ function classifyPacketUnits(params: {
     ((selectedRole === "query_context" || selectedRole === "time_constraint") &&
       !selectedAssistantAnswer)
   ) {
-    const answerUnits = contextAnswerUnits.filter(
-      (unit) =>
-        (unit.authorRole === "assistant" || unitHasAnswerRole(unit)) &&
-        !unitIsQuestionLike(params.queryAnalysis, unit),
+    const answerUnits = answerUnitsForMode(
+      params.queryAnalysis,
+      contextAnswerUnits.filter(
+        (unit) =>
+          (unit.authorRole === "assistant" || unitHasAnswerRole(unit)) &&
+          !unitIsQuestionLike(params.queryAnalysis, unit),
+      ),
     );
     if (answerUnits.length > 0) {
       return {
@@ -594,13 +667,31 @@ function classifyPacketUnits(params: {
   }
 
   if (unitLooksLikeAnswer(params.queryAnalysis, selectedUnit) && !selectedIsQuestion) {
+    const answerUnits = answerUnitsForMode(
+      params.queryAnalysis,
+      params.queryAnalysis.answerMode === "multi_evidence"
+        ? [
+            selectedUnit,
+            ...contextAnswerUnits.filter(
+              (unit) =>
+                unit.unitId !== selectedUnit.unitId &&
+                !unitIsQuestionLike(params.queryAnalysis, unit),
+            ),
+          ]
+        : [selectedUnit],
+    );
     return {
-      answerUnits: [selectedUnit],
+      answerUnits,
       contextUnits: contextUnits.filter(
-        (unit) => unit.roles.includes("query_context") || unit.roles.includes("time_constraint"),
+        (unit) =>
+          !answerUnits.includes(unit) &&
+          (unit.roles.includes("query_context") || unit.roles.includes("time_constraint")),
       ),
       supportUnits: contextUnits.filter(
-        (unit) => !unit.roles.includes("query_context") && !unit.roles.includes("time_constraint"),
+        (unit) =>
+          !answerUnits.includes(unit) &&
+          !unit.roles.includes("query_context") &&
+          !unit.roles.includes("time_constraint"),
       ),
     };
   }
@@ -1142,6 +1233,74 @@ function authorityScore(entry: PromptEvidenceCandidate): number {
 function stringArray(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return value.filter((item): item is string => typeof item === "string" && item.trim().length > 0);
+}
+
+function requestedAttributeSlotsForQuery(queryAnalysis: QueryCompileResult): string[] {
+  const slotHints = (queryAnalysis.evidencePlan?.slots ?? []).flatMap((slot) => [
+    ...(slot.requestedAttributeSlots ?? []),
+    slot.description,
+    ...slot.requiredFields,
+    ...(slot.relationHints ?? []),
+  ]);
+  return [
+    ...new Set(
+      [
+        ...requestedAttributeSlotsFromText(
+          queryAnalysis.queryText,
+          queryAnalysis.focusedQuery,
+          ...slotHints,
+        ),
+        ...slotHints.map(canonicalAttributeSlot).filter((slot): slot is string => Boolean(slot)),
+      ],
+    ),
+  ];
+}
+
+function attributeSlotsForEntry(entry: PromptEvidenceCandidate): string[] {
+  const metadata = entry.metadata ?? {};
+  const directPredicate =
+    typeof metadata.predicate === "string"
+      ? metadata.predicate
+      : typeof metadata.relationType === "string"
+        ? metadata.relationType
+        : undefined;
+  const relationSlot =
+    typeof metadata.relationSlot === "string"
+      ? metadata.relationSlot
+      : typeof metadata.componentRole === "string"
+        ? metadata.componentRole
+        : undefined;
+  return [
+    ...new Set(
+      [
+        attributeSlotFromPredicate(directPredicate),
+        canonicalAttributeSlot(relationSlot),
+        ...requestedAttributeSlotsFromText(
+          entry.text,
+          entry.rawText,
+          entry.scoringText,
+          directPredicate,
+          relationSlot,
+          typeof metadata.canonicalObject === "string" ? metadata.canonicalObject : undefined,
+        ),
+      ].filter((slot): slot is string => Boolean(slot)),
+    ),
+  ];
+}
+
+function entryMatchesRequestedAttributeSlot(
+  queryAnalysis: QueryCompileResult,
+  entry: PromptEvidenceCandidate,
+): boolean {
+  const requestedSlots = requestedAttributeSlotsForQuery(queryAnalysis);
+  if (requestedSlots.length === 0 || entry.surface !== "fact") {
+    return true;
+  }
+  const predicate = typeof entry.metadata?.predicate === "string" ? entry.metadata.predicate : undefined;
+  if (predicate && predicateMatchesAttributeSlots(predicate, requestedSlots)) {
+    return true;
+  }
+  return attributeSlotsForEntry(entry).some((slot) => requestedSlots.includes(slot));
 }
 
 function sameSemanticChainSupport(
@@ -1734,6 +1893,18 @@ function hardExclusionReasons(params: {
   if (isAssistantAcknowledgement(params.entry)) {
     blockers.push("assistant-acknowledgement-not-evidence");
   }
+  if (
+    entryAuthorRole(params.entry) === "assistant" &&
+    !queryAllowsAssistantAuthoredAnswer(params.queryAnalysis)
+  ) {
+    const role = inferredSlotRole(params.queryAnalysis, params.entry);
+    if (role === "answer_value" || role === "answer_event" || params.answer >= 0.42) {
+      blockers.push("assistant-authored-answer-not-authoritative");
+    }
+  }
+  if (!entryMatchesRequestedAttributeSlot(params.queryAnalysis, params.entry)) {
+    blockers.push("attribute-slot-mismatch");
+  }
   blockers.push(...stateHardExclusions(params.entry, params.now));
   return [...new Set(blockers)];
 }
@@ -2236,6 +2407,17 @@ function contextCandidatesForGroup(params: {
     params.queryAnalysis.answerMode !== "count_aggregate" &&
     (userQuestionBridge || assistantAnswerBridge);
   const sourceFamilies = new Set(bindingAnswerRefs.map((sourceRef) => sourceFamilyRef(sourceRef)));
+  const answerSourceAdjacent = (entry: PromptEvidenceCandidate): boolean =>
+    sourceRefsAdjacent(bindingAnswerRefs, bindingSourceRefsForEntry(entry), 2);
+  const multiEvidenceCanonicalSiblingRank = (entry: PromptEvidenceCandidate): number => {
+    if (params.queryAnalysis.answerMode !== "multi_evidence" || entry.surface !== "fact") {
+      return 0;
+    }
+    if (!answerSourceAdjacent(entry)) {
+      return 0;
+    }
+    return inferredSlotRole(params.queryAnalysis, entry) === "answer_value" ? 3 : 2;
+  };
   const local = params.entries.filter((entry) => entryKey(entry) !== entryKey(params.answerEntry));
   const related = params.allEntries.filter((entry) => {
     if (entryKey(entry) === entryKey(params.answerEntry) || entry.dropReason) {
@@ -2278,6 +2460,11 @@ function contextCandidatesForGroup(params: {
   });
   return [...new Map([...local, ...related].map((entry) => [entryKey(entry), entry])).values()]
     .sort((left, right) => {
+      const leftCanonicalSibling = multiEvidenceCanonicalSiblingRank(left);
+      const rightCanonicalSibling = multiEvidenceCanonicalSiblingRank(right);
+      if (leftCanonicalSibling !== rightCanonicalSibling) {
+        return rightCanonicalSibling - leftCanonicalSibling;
+      }
       const leftAdjacent = sourceRefsAdjacent(bindingAnswerRefs, bindingSourceRefsForEntry(left), 2)
         ? 1
         : 0;
@@ -2299,7 +2486,7 @@ function contextCandidatesForGroup(params: {
       }
       return candidateRetrievalScore(right) - candidateRetrievalScore(left);
     })
-    .slice(0, 3);
+    .slice(0, params.queryAnalysis.answerMode === "multi_evidence" ? 8 : 3);
 }
 
 function packetFromGroup(params: {
@@ -2380,14 +2567,13 @@ function packetFromGroup(params: {
   if (!rankedSelected) {
     return null;
   }
-  const rankedSourceRefs = sourceRefsForEntry(rankedSelected.entry);
   const canonicalSubstituteEntry =
     directFactAnswerMode && rankedSelected.entry.surface !== "fact"
       ? params.allEntries.find(
           (entry) =>
             entry.surface === "fact" &&
             !entry.dropReason &&
-            sourceRefsForEntry(entry).some((sourceRef) => rankedSourceRefs.includes(sourceRef)),
+            entriesShareBindingSourceIdentity(entry, rankedSelected.entry),
         )
       : undefined;
   const selected =
@@ -2415,13 +2601,27 @@ function packetFromGroup(params: {
           }),
         }
       : rankedSelected;
-  const directFactContextSatisfied =
+  const canonicalFactContextSatisfied =
     directFactAnswerMode &&
     selected.entry.surface === "fact" &&
     selected.graded.blockers.length === 0 &&
     missingRequiredAfterContext(selected.entry, selected.contextCandidates).length === 0;
-  const selectedContextCandidates = directFactContextSatisfied ? [] : selected.contextCandidates;
-  const coverageContextCandidates = directFactContextSatisfied
+  const directFactContextSatisfied =
+    params.queryAnalysis.answerMode !== "multi_evidence" && canonicalFactContextSatisfied;
+  const hideCanonicalFactSupport =
+    selected.entry.surface === "fact" &&
+    canonicalFactContextSatisfied &&
+    (directFactContextSatisfied || params.queryAnalysis.answerMode === "multi_evidence");
+  const visibleCanonicalFactContextCandidates =
+    params.queryAnalysis.answerMode === "multi_evidence"
+      ? selected.contextCandidates.filter((entry) => entry.surface === "fact" && !entry.dropReason)
+      : [];
+  const selectedContextCandidates = directFactContextSatisfied
+    ? []
+    : hideCanonicalFactSupport
+      ? visibleCanonicalFactContextCandidates
+      : selected.contextCandidates;
+  const coverageContextCandidates = hideCanonicalFactSupport
     ? selected.contextCandidates
     : selectedContextCandidates;
   const unitGroups = classifyPacketUnits({
@@ -2433,6 +2633,24 @@ function packetFromGroup(params: {
     queryAnalysis: params.queryAnalysis,
     ...unitGroups,
   });
+  const multiEvidenceContextSatisfied =
+    params.queryAnalysis.answerMode === "multi_evidence" &&
+    canonicalFactContextSatisfied &&
+    unitGroups.answerUnits.some((unit) => unit.origin === "canonical_fact") &&
+    (unitGroups.answerUnits.length > 1 ||
+      selected.contextCandidates.some((entry) => {
+        const author = entryAuthorRole(entry);
+        return (
+          (entry.surface === "chunk" || entry.surface === "event" || entry.surface === "snippet") &&
+          author !== "assistant" &&
+          !entryIsQueryLikeEvidence(params.queryAnalysis, entry) &&
+          sourceRefsAdjacent(
+            bindingSourceRefsForEntry(selected.entry),
+            bindingSourceRefsForEntry(entry),
+            2,
+          )
+        );
+      }));
   const op = operationType(params.queryAnalysis);
   const returnValueMode = op === "return_value" || params.queryAnalysis.answerMode === "attribute_lookup";
   const hasAnswerDisplayLine = displayLines.some(
@@ -2460,7 +2678,8 @@ function packetFromGroup(params: {
   const packetSuppliesDirectCause =
     packetDirectCauseScore >= 0.72 &&
     directCausalExplanationScore(params.queryAnalysis, selected.entry) < 0.5;
-  const directFactHiddenSupportPenalties = directFactContextSatisfied
+  const contextSupportedCanonicalFact = directFactContextSatisfied || multiEvidenceContextSatisfied;
+  const directFactHiddenSupportPenalties = contextSupportedCanonicalFact
     ? selected.graded.softPenalties.filter(
         (reason) =>
           reason !== "answer-without-bound-context" &&
@@ -2492,7 +2711,7 @@ function packetFromGroup(params: {
         ),
       }
     : selected.graded.grade;
-  const contextSupportedFactGrade: EvidenceGrade = directFactContextSatisfied
+  const contextSupportedFactGrade: EvidenceGrade = contextSupportedCanonicalFact
     ? {
         ...packetCausalGrade,
         answerScore: Math.max(packetCausalGrade.answerScore, 0.46),
@@ -2801,11 +3020,64 @@ function packetCoverageSatisfied(packet: EvidencePacket): boolean {
   return packet.coverage.filled && packet.coverage.missing.length === 0;
 }
 
+function slotActsAsAnswerValue(slot: QueryEvidenceSlot): boolean {
+  const requiredRole = evidenceSlotRequiredRole(slot);
+  return requiredRole === "answer_value" || slot.role === "answer_evidence";
+}
+
+function answerSlotIds(queryAnalysis: QueryCompileResult): Set<string> {
+  return new Set(
+    (queryAnalysis.evidencePlan?.slots ?? [])
+      .filter(slotActsAsAnswerValue)
+      .map((slot) => slot.id),
+  );
+}
+
+function packetFilledSlotIds(packet: EvidencePacket): Set<string> {
+  return new Set(
+    packet.answerCandidate?.filledSlotIds ??
+      (packet.answerCandidate?.slotCoverage ?? [])
+        .filter((coverage) => coverage.filled)
+        .map((coverage) => coverage.slotId),
+  );
+}
+
+function packetFillsAnswerSlot(queryAnalysis: QueryCompileResult, packet: EvidencePacket): boolean {
+  const answerSlots = answerSlotIds(queryAnalysis);
+  if (answerSlots.size === 0) {
+    return false;
+  }
+  const filled = packetFilledSlotIds(packet);
+  for (const slotId of filled) {
+    if (answerSlots.has(slotId)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function packetFillsSlot(packet: EvidencePacket, slotId: string): boolean {
+  return packetFilledSlotIds(packet).has(slotId);
+}
+
+function packetCoverageSatisfiedForPrompt(
+  queryAnalysis: QueryCompileResult,
+  packet: EvidencePacket,
+): boolean {
+  return (
+    packetCoverageSatisfied(packet) ||
+    (queryAnalysis.answerMode === "multi_evidence" && packetFillsAnswerSlot(queryAnalysis, packet))
+  );
+}
+
 function packetHasBlockingPromptPenalty(
   queryAnalysis: QueryCompileResult,
   packet: EvidencePacket,
 ): boolean {
-  if (packetHasSoftPenaltyPrefix(packet, "missing-context:")) {
+  if (
+    packetHasSoftPenaltyPrefix(packet, "missing-context:") &&
+    !(queryAnalysis.answerMode === "multi_evidence" && packetFillsAnswerSlot(queryAnalysis, packet))
+  ) {
     return true;
   }
   if (packetHasSoftPenalty(packet, "answer-without-bound-context")) {
@@ -2815,6 +3087,19 @@ function packetHasBlockingPromptPenalty(
     operationType(queryAnalysis) === "return_value" &&
     packetHasSoftPenalty(packet, "weak-query-context-binding")
   );
+}
+
+function nonInjectedDropReason(
+  queryAnalysis: QueryCompileResult,
+  packet: EvidencePacket,
+): string | undefined {
+  if (packet.dropReason) {
+    return packet.dropReason;
+  }
+  if (packetHasBlockingPromptPenalty(queryAnalysis, packet)) {
+    return "unbound-query-context";
+  }
+  return undefined;
 }
 
 function packetPromptInjectionFloor(
@@ -2828,7 +3113,9 @@ function packetPromptInjectionFloor(
   if (queryAnalysis.answerMode === "count_aggregate" || operationType(queryAnalysis) === "aggregate") {
     return Math.max(0.5, floor + 0.16);
   }
-  return packetCoverageSatisfied(packet) ? Math.max(0.52, floor + 0.2) : Math.max(0.62, floor + 0.12);
+  return packetCoverageSatisfiedForPrompt(queryAnalysis, packet)
+    ? Math.max(0.52, floor + 0.2)
+    : Math.max(0.62, floor + 0.12);
 }
 
 function packetEligibleForPromptInjection(
@@ -2864,6 +3151,144 @@ function packetHasAnswerDisplayForQuery(
       line.startsWith("[resource]") ||
       (aggregateMode && line.startsWith("[event]")),
   );
+}
+
+function packetIsCanonicalFactAnswer(queryAnalysis: QueryCompileResult, packet: EvidencePacket): boolean {
+  return (
+    packet.answerCandidate?.surface === "fact" &&
+    packetCoverageSatisfied(packet) &&
+    packetHasAnswerDisplayForQuery(queryAnalysis, packet)
+  );
+}
+
+function packetIsCanonicalSlotAnswer(
+  queryAnalysis: QueryCompileResult,
+  packet: EvidencePacket,
+  slotId: string,
+): boolean {
+  return (
+    packet.answerCandidate?.surface === "fact" &&
+    packetFillsSlot(packet, slotId) &&
+    packetHasAnswerDisplayForQuery(queryAnalysis, packet)
+  );
+}
+
+function packetIsAssistantChunkAnswer(packet: EvidencePacket): boolean {
+  const candidate = packet.answerCandidate;
+  const metadataRole = candidate?.metadata?.role;
+  return (
+    (candidate?.surface === "chunk" || candidate?.surface === "snippet") &&
+    (metadataRole === "assistant" || (packet.authorRoles ?? []).includes("assistant"))
+  );
+}
+
+function normalizedPacketRefKeys(packet: EvidencePacket): Set<string> {
+  const refs = [
+    ...normalizeSourceRefs(packet.sourceRefs),
+    ...normalizeSourceRefs(packet.supportSourceRefs ?? []),
+    ...normalizeSourceRefs(packet.allSourceRefs ?? []),
+  ];
+  return new Set(refs.flatMap((ref) => [ref.raw, `${ref.kind}:${ref.id}`, ...ref.parentRefs]));
+}
+
+function packetsShareLineage(left: EvidencePacket, right: EvidencePacket): boolean {
+  const leftRefs = normalizedPacketRefKeys(left);
+  const rightRefs = normalizedPacketRefKeys(right);
+  for (const ref of leftRefs) {
+    if (rightRefs.has(ref)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function canonicalFactAnchorDominatesText(packet: EvidencePacket, text: string): boolean {
+  const normalizedText = normalizeText(text);
+  if (!normalizedText) {
+    return false;
+  }
+  const candidate = packet.answerCandidate;
+  const metadata = candidate?.metadata ?? {};
+  const factText = candidate?.text ?? packet.primaryText ?? "";
+  const subject =
+    typeof metadata.canonicalSubject === "string"
+      ? metadata.canonicalSubject
+      : /^(?:\[answer\]\s*)?(.+?)\s+--/iu.exec(factText)?.[1]?.trim() ??
+        /^(?:\[answer\]\s*)?(.+?)\s+has\s+/iu.exec(factText)?.[1]?.trim();
+  const object =
+    typeof metadata.canonicalObject === "string"
+      ? metadata.canonicalObject
+      : typeof metadata.value === "string"
+        ? metadata.value
+        : undefined;
+  const parsedObject =
+    !object && candidate?.text
+      ? /--[^>\n]+-->\s*([^\n|]+)/u.exec(candidate.text)?.[1]?.trim()
+      : undefined;
+  const normalizedSubject = subject ? normalizeText(subject) : "";
+  const normalizedObject = normalizeText(object ?? parsedObject ?? "");
+  if (!normalizedSubject || !normalizedObject) {
+    return false;
+  }
+  return normalizedText.includes(normalizedSubject) && normalizedText.includes(normalizedObject);
+}
+
+function canonicalFactDominatesAssistantRestatement(params: {
+  queryAnalysis: QueryCompileResult;
+  factPacket: EvidencePacket;
+  assistantPacket: EvidencePacket;
+}): boolean {
+  if (!packetIsCanonicalFactAnswer(params.queryAnalysis, params.factPacket)) {
+    return false;
+  }
+  if (!packetIsAssistantChunkAnswer(params.assistantPacket)) {
+    return false;
+  }
+  if (packetsShareLineage(params.factPacket, params.assistantPacket)) {
+    return true;
+  }
+  const factText = (params.factPacket.displayLines ?? [params.factPacket.primaryText]).join("\n");
+  const assistantText = (
+    params.assistantPacket.displayLines ?? [params.assistantPacket.primaryText]
+  ).join("\n");
+  if (canonicalFactAnchorDominatesText(params.factPacket, assistantText)) {
+    return true;
+  }
+  return semanticTextSimilarity(factText, assistantText) >= 0.72;
+}
+
+function suppressDominatedInjectedPackets(
+  queryAnalysis: QueryCompileResult,
+  packets: EvidencePacket[],
+  injectedPacketIds: Set<string>,
+): Set<string> {
+  const selected = new Set(injectedPacketIds);
+  const canonicalFactPackets = packets.filter(
+    (packet) => selected.has(packet.packetId) && packetIsCanonicalFactAnswer(queryAnalysis, packet),
+  );
+  if (canonicalFactPackets.length === 0) {
+    return selected;
+  }
+  for (const packet of packets) {
+    if (!selected.has(packet.packetId)) {
+      continue;
+    }
+    if (!packetIsAssistantChunkAnswer(packet)) {
+      continue;
+    }
+    if (
+      canonicalFactPackets.some((factPacket) =>
+        canonicalFactDominatesAssistantRestatement({
+          queryAnalysis,
+          factPacket,
+          assistantPacket: packet,
+        }),
+      )
+    ) {
+      selected.delete(packet.packetId);
+    }
+  }
+  return selected;
 }
 
 function selectInjectedPackets(
@@ -2912,7 +3337,7 @@ function selectInjectedPackets(
     operationType(queryAnalysis) === "return_value" ||
     queryAnalysis.answerMode === "single_fact" ||
     queryAnalysis.answerMode === "attribute_lookup"
-  )
+  ) && queryAnalysis.answerMode !== "multi_evidence"
     ? selectablePackets.find(
         (packet) =>
           packet.answerCandidate?.surface === "fact" &&
@@ -2924,8 +3349,12 @@ function selectInjectedPackets(
     return new Set([directCanonicalAnswer.packetId]);
   }
   const slotCoverageMode =
-    operationType(queryAnalysis) === "derive" || operationType(queryAnalysis) === "compare";
+    queryAnalysis.answerMode === "multi_evidence" ||
+    operationType(queryAnalysis) === "derive" ||
+    operationType(queryAnalysis) === "compare";
   if (slotCoverageMode) {
+    const answerSlotsForSelection = answerSlotIds(queryAnalysis);
+    const selectedAnswerSlotIds = new Set<string>();
     const bySlot = new Map<string, EvidencePacket[]>();
     for (const packet of selectablePackets) {
       const packetSlotIds =
@@ -2936,23 +3365,43 @@ function selectInjectedPackets(
         bySlot.set(slotId, slotPackets);
       }
     }
-    for (const slot of queryAnalysis.evidencePlan?.slots ?? []) {
+    const plannedSlots =
+      queryAnalysis.answerMode === "multi_evidence" && answerSlotsForSelection.size > 1
+        ? (queryAnalysis.evidencePlan?.slots ?? []).filter((slot) =>
+            answerSlotsForSelection.has(slot.id),
+          )
+        : (queryAnalysis.evidencePlan?.slots ?? []);
+    for (const slot of plannedSlots) {
       if (selected.size >= limit) {
         break;
       }
-      const packet = bySlot
-        .get(slot.id)
-        ?.find((candidate) => (candidate.grade?.finalScore ?? 0) >= floor);
+      const slotPackets = bySlot.get(slot.id) ?? [];
+      const packet =
+        slotPackets.find(
+          (candidate) =>
+            packetIsCanonicalSlotAnswer(queryAnalysis, candidate, slot.id) &&
+            (candidate.grade?.finalScore ?? 0) >= floor,
+        ) ?? slotPackets.find((candidate) => (candidate.grade?.finalScore ?? 0) >= floor);
       if (packet) {
         const displayKey = packetAnswerDisplayKey(packet);
         if (!aggregateMode && displayKey && selectedAnswerDisplays.has(displayKey)) {
           continue;
         }
         selected.add(packet.packetId);
+        if (answerSlotsForSelection.has(slot.id)) {
+          selectedAnswerSlotIds.add(slot.id);
+        }
         if (!aggregateMode && displayKey) {
           selectedAnswerDisplays.add(displayKey);
         }
       }
+    }
+    if (
+      queryAnalysis.answerMode === "multi_evidence" &&
+      answerSlotsForSelection.size > 1 &&
+      [...answerSlotsForSelection].every((slotId) => selectedAnswerSlotIds.has(slotId))
+    ) {
+      return selected;
     }
   }
   for (const packet of selectablePackets) {
@@ -3162,6 +3611,20 @@ function evidencePacketAudit(params: {
   const rankedPackets = [...params.packets]
     .filter((packet) => !packet.dropReason)
     .sort((left, right) => (right.grade?.finalScore ?? 0) - (left.grade?.finalScore ?? 0));
+  const droppedPackets = params.packets.filter((packet) => packet.dropReason);
+  const summarizePacket = (packet: EvidencePacket) => ({
+    packetId: packet.packetId,
+    injected: packet.injected ?? params.injectedPacketIds.has(packet.packetId),
+    score: packet.score,
+    finalScore: packet.grade?.finalScore,
+    sourceRefs: packet.sourceRefs,
+    allSourceRefs: packet.allSourceRefs ?? packet.sourceRefs,
+    normalizedSourceRefs: packet.normalizedSourceRefs,
+    normalizedAllSourceRefs: packet.normalizedAllSourceRefs,
+    primaryText: truncateText(packet.primaryText, 720),
+    displayLines: packet.displayLines,
+    selectionReason: packet.selectionReason,
+  });
   const units = allPacketUnits(params.packets);
   return {
     operation: params.operation,
@@ -3220,6 +3683,13 @@ function evidencePacketAudit(params: {
       normalizedSourceRefs: packet.normalizedSourceRefs,
       normalizedAllSourceRefs: packet.normalizedAllSourceRefs,
       selectionReason: packet.selectionReason,
+    })),
+    eligibleEvidencePackets: rankedPackets.map(summarizePacket),
+    droppedEvidencePackets: droppedPackets.map((packet) => ({
+      ...summarizePacket(packet),
+      dropReason: packet.dropReason ?? "dropped",
+      softPenalties: packet.softPenalties ?? [],
+      hardExclusions: packet.hardExclusions ?? [],
     })),
     injectedPackets: [...params.injectedPacketIds],
     renderedPromptLines: params.packets
@@ -3282,9 +3752,14 @@ export function assembleEvidencePackets(input: EvidenceAssemblerInput): Evidence
     }),
   ];
   const deduped = allPackets;
-  const injectedPacketIds = selectInjectedPackets(input.queryAnalysis, deduped);
+  const injectedPacketIds = suppressDominatedInjectedPackets(
+    input.queryAnalysis,
+    deduped,
+    selectInjectedPackets(input.queryAnalysis, deduped),
+  );
   const packets = deduped.map((packet) => {
     const injected = injectedPacketIds.has(packet.packetId);
+    const dropReason = injected ? undefined : nonInjectedDropReason(input.queryAnalysis, packet);
     return {
       ...packet,
       role: injected ? ("answer" as const) : packet.role,
@@ -3293,7 +3768,7 @@ export function assembleEvidencePackets(input: EvidenceAssemblerInput): Evidence
       protectionReason: injected
         ? (packet.selectionReason ?? "packet-final-score")
         : packet.protectionReason,
-      dropReason: injected ? undefined : packet.dropReason,
+      dropReason,
       coverage: packet.coverage,
     };
   });

@@ -81,6 +81,7 @@ test("Codex uninstall removes memx plugin and marketplace config", async () => {
     ),
   );
   const calls = [];
+  const stopped = [];
 
   const result = await runCodexUninstall(
     { configPath, homeDir: dir, codexBin: "codex-test", codexMarketplaceDir },
@@ -89,6 +90,16 @@ test("Codex uninstall removes memx plugin and marketplace config", async () => {
       runCommand: async (command, args) => {
         calls.push({ command, args });
         return { code: 0 };
+      },
+      stopService: async (options) => {
+        stopped.push(options);
+        return {
+          ok: true,
+          alreadyRunning: false,
+          url: "http://127.0.0.1:3878",
+          pidPath: join(dir, ".memx", "service.json"),
+          logPath: join(dir, ".memx", "memx-server.log"),
+        };
       },
     },
   );
@@ -103,6 +114,9 @@ test("Codex uninstall removes memx plugin and marketplace config", async () => {
   assert.equal(result.backupPath, `${configPath}.bak.123`);
   assert.equal(existsSync(codexMarketplaceDir), false);
   assert.equal(existsSync(codexCacheDir), false);
+  assert.equal(stopped.length, 1);
+  assert.equal(stopped[0].homeDir, dir);
+  assert.equal(result.service.ok, true);
 });
 
 test("Claude Code uninstall removes memx MCP server, native plugin, and marketplace", async () => {
@@ -145,6 +159,7 @@ test("Claude Code uninstall removes memx MCP server, native plugin, and marketpl
     "utf8",
   );
   const calls = [];
+  const stopped = [];
 
   const result = await runClaudeCodeUninstall(
     { configPath, homeDir: dir, claudeBin: "claude-test", claudeMarketplaceDir },
@@ -153,6 +168,16 @@ test("Claude Code uninstall removes memx MCP server, native plugin, and marketpl
       runCommand: async (command, args) => {
         calls.push({ command, args });
         return { code: 0 };
+      },
+      stopService: async (options) => {
+        stopped.push(options);
+        return {
+          ok: true,
+          alreadyRunning: false,
+          url: "http://127.0.0.1:3878",
+          pidPath: join(dir, ".memx", "service.json"),
+          logPath: join(dir, ".memx", "memx-server.log"),
+        };
       },
     },
   );
@@ -167,6 +192,9 @@ test("Claude Code uninstall removes memx MCP server, native plugin, and marketpl
   assert.equal(result.backupPath, `${configPath}.bak.123`);
   assert.equal(existsSync(claudeMarketplaceDir), false);
   assert.equal(existsSync(claudeCacheDir), false);
+  assert.equal(stopped.length, 1);
+  assert.equal(stopped[0].homeDir, dir);
+  assert.equal(result.service.ok, true);
 });
 
 test("Claude Code uninstall restores native memory settings that quickstart changed", async () => {

@@ -6,9 +6,9 @@ import { runConsolidation } from "../pipeline/consolidate.mjs";
 import { MemxReasoner } from "../pipeline/reasoner.mjs";
 import { OptionalEmbeddingBackend } from "../search/backends/embeddingBackend.mjs";
 import { buildOperationContext } from "../runtime.mjs";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
 //#region src/cli/registerCli.ts
 const DEFAULT_USER_CONFIG_PATH = path.join(homedir(), ".openclaw", "openclaw.json");
 const PLUGIN_ID = MEMX_PLUGIN_ID;

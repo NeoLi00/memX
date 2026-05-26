@@ -1,7 +1,7 @@
 import { stableHash, truncateText } from "../support.mjs";
-import { shouldProjectActiveProjectAlias } from "./authority.mjs";
 import { filterBootstrapRows } from "./bootstrapFilter.mjs";
 import { dedupeEvidenceRows, splitLabelValue, toEvidenceRow } from "./memoryObjectsHelpers.mjs";
+import { shouldProjectActiveProjectAlias } from "./authority.mjs";
 //#region src/pipeline/memoryObjectsProjection.ts
 function stateValueFromRow(row) {
 	return splitLabelValue(row.text).value || row.text;

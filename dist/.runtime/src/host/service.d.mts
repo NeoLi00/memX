@@ -1,5 +1,5 @@
-import { MemxTurnEnvelope } from "./hookPayload.mjs";
 import { EvidenceBundle, MemoryPluginConfig, MemxLogger, QueryCompileResult } from "../types.mjs";
+import { MemxTurnEnvelope } from "./hookPayload.mjs";
 
 //#region src/host/service.d.ts
 type MemxServiceOptions = {
@@ -31,7 +31,8 @@ type NativeContextEligibility = {
   bestScore: number;
 };
 declare function focusRecallBundleForQueryEntities(queryAnalysis: Pick<QueryCompileResult, "queryEntities">, bundle: EvidenceBundle): EvidenceBundle;
-declare function assessNativeContextEligibility(_query: string, queryAnalysis: QueryCompileResult, bundle: EvidenceBundle): NativeContextEligibility;
+declare function focusRecallBundleForDegradedQueryAnchors(query: string, queryAnalysis: QueryCompileResult, bundle: EvidenceBundle): EvidenceBundle;
+declare function assessNativeContextEligibility(query: string, queryAnalysis: QueryCompileResult, bundle: EvidenceBundle): NativeContextEligibility;
 declare class MemxHostService {
   private readonly config;
   private readonly logger;
@@ -53,4 +54,4 @@ declare class MemxHostService {
 }
 declare function stableHostTurnId(envelope: MemxTurnEnvelope): string;
 //#endregion
-export { MemxAgentRequest, MemxHostService, MemxRecallRequest, MemxServiceOptions, assessNativeContextEligibility, createServiceConfigFromEnv, focusRecallBundleForQueryEntities, formatNativeRecallContext, stableHostTurnId };
+export { MemxAgentRequest, MemxHostService, MemxRecallRequest, MemxServiceOptions, assessNativeContextEligibility, createServiceConfigFromEnv, focusRecallBundleForDegradedQueryAnchors, focusRecallBundleForQueryEntities, formatNativeRecallContext, stableHostTurnId };

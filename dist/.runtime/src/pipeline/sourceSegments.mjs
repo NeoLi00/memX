@@ -1,6 +1,6 @@
 import { stableHash } from "../support.mjs";
-import { CHUNK_VECTOR_CONFIDENCE } from "./constants.mjs";
 import { buildVectorDocMetadata } from "./vectorDocMetadata.mjs";
+import { CHUNK_VECTOR_CONFIDENCE } from "./constants.mjs";
 //#region src/pipeline/sourceSegments.ts
 const SOURCE_SEGMENT_TARGET_CHARS = 1800;
 function segmentBoundary(text, start, idealEnd, targetChars) {

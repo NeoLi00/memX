@@ -17,7 +17,7 @@ import { runAutomaticMaintenanceBatch } from "./pipeline/maintenanceBatch.js";
 import { MemxReasoner } from "./pipeline/reasoner.js";
 import { MemxTurnScheduler } from "./pipeline/turnScheduler.js";
 import { OptionalEmbeddingBackend } from "./search/backends/embeddingBackend.js";
-import { defaultRetrievalScopes, renderTemplate } from "./security/scopes.js";
+import { defaultRetrievalScopes, renderTemplate, scopeVarsForContext } from "./security/scopes.js";
 import { nowIso, randomId, resolveUserPath } from "./support.js";
 import type {
   MaintenanceBatchTriggerReason,
@@ -56,12 +56,24 @@ function maintenanceKey(agentId: string, dbPath: string, sessionKey: string): st
   return `${agentId}:${dbPath}:${sessionKey}`;
 }
 
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values.filter((value) => value.trim().length > 0))];
+}
+
 type MaintenanceContextTemplate = MemoryOperationContext;
 type StagedRecallableTurn = {
   turnId: string;
   observedAt: string;
   text: string;
 };
+
+function stagedRecallKey(
+  ctx: Pick<MemoryOperationContext, "agentId" | "dbPath" | "sessionKey" | "workspaceDir">,
+): string {
+  const workspace = ctx.workspaceDir?.trim();
+  const scope = workspace ? `workspace:${workspace}` : `session:${ctx.sessionKey ?? "default"}`;
+  return `${ctx.agentId}:${ctx.dbPath}:${scope}`;
+}
 
 export function resolveDbPath(
   config: MemoryPluginConfig,
@@ -70,12 +82,7 @@ export function resolveDbPath(
   if (!actor.agentId) {
     return null;
   }
-  const rendered = renderTemplate(config.dbPath, {
-    agentId: actor.agentId,
-    sessionKey: actor.sessionKey,
-    project: actor.project,
-    workspace: actor.workspaceDir,
-  });
+  const rendered = renderTemplate(config.dbPath, scopeVarsForContext(actor));
   return resolveUserPath(rendered);
 }
 
@@ -100,12 +107,7 @@ export function buildOperationContext(
     channelId: actor.channelId,
     config,
     dbPath,
-    scopes: defaultRetrievalScopes(config, {
-      agentId: actor.agentId,
-      sessionKey: actor.sessionKey,
-      project: actor.project,
-      workspace: actor.workspaceDir,
-    }),
+    scopes: defaultRetrievalScopes(config, scopeVarsForContext(actor)),
     now: overrides?.now ?? nowIso(),
     llmBudgetAudit: createMemoryLlmBudgetAudit(),
   };
@@ -143,6 +145,7 @@ export class MemxRuntimeManager {
   async closeAll(): Promise<void> {
     await this.flushAll();
     await this.flushPendingMaintenance("shutdown");
+    await this.flushRetryableSemanticWriteJobs("shutdown");
     for (const timer of this.maintenanceTimers.values()) {
       clearTimeout(timer);
     }
@@ -207,10 +210,9 @@ export class MemxRuntimeManager {
   }
 
   rememberStagedRecallableTurn(
-    ctx: Pick<MemoryOperationContext, "agentId" | "sessionKey">,
+    ctx: Pick<MemoryOperationContext, "agentId" | "dbPath" | "sessionKey" | "workspaceDir">,
     messages: TurnCaptureMessage[],
   ): void {
-    const sessionKey = ctx.sessionKey ?? "default";
     const text = messages
       .map((message) => `[${message.role}] ${message.content.trim()}`)
       .filter((entry) => entry.trim().length > 0)
@@ -218,7 +220,7 @@ export class MemxRuntimeManager {
     if (!text.trim()) {
       return;
     }
-    const key = `${ctx.agentId}:${sessionKey}`;
+    const key = stagedRecallKey(ctx);
     const turnId = messages[0]?.turnId ?? randomId("staged-turn");
     const observedAt = messages.at(-1)?.observedAt ?? nowIso();
     const existing = (this.stagedRecallableTurns.get(key) ?? []).filter(
@@ -229,11 +231,10 @@ export class MemxRuntimeManager {
   }
 
   recentStagedRecallableTurns(
-    ctx: Pick<MemoryOperationContext, "agentId" | "sessionKey">,
+    ctx: Pick<MemoryOperationContext, "agentId" | "dbPath" | "sessionKey" | "workspaceDir">,
     limit = 4,
   ): StagedRecallableTurn[] {
-    const sessionKey = ctx.sessionKey ?? "default";
-    const key = `${ctx.agentId}:${sessionKey}`;
+    const key = stagedRecallKey(ctx);
     return [...(this.stagedRecallableTurns.get(key) ?? [])]
       .sort((left, right) => right.observedAt.localeCompare(left.observedAt))
       .slice(0, Math.max(1, Math.min(Math.trunc(limit), 8)));
@@ -471,6 +472,86 @@ export class MemxRuntimeManager {
     }
   }
 
+  private storeContextTemplatesForStore(store: MemxStoreBundle): MaintenanceContextTemplate[] {
+    const templates = [...this.storeContexts.values()].filter(
+      (template) => template.dbPath === store.client.dbPath,
+    );
+    const seen = new Set<string>();
+    const deduped: MaintenanceContextTemplate[] = [];
+    for (const template of templates) {
+      const key = `${template.agentId}:${template.sessionKey ?? "default"}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      deduped.push(template);
+    }
+    return deduped;
+  }
+
+  private async flushRetryableSemanticWriteJobs(reason: MaintenanceBatchTriggerReason): Promise<void> {
+    const entries = await Promise.all(this.stores.values());
+    for (const store of entries) {
+      for (const baseTemplate of this.storeContextTemplatesForStore(store)) {
+        const now = nowIso();
+        const retryJobs = store.auditRepo.listRetryableSemanticWriteJobs({
+          agentId: baseTemplate.agentId,
+          now,
+          limit: 200,
+        });
+        const sessionKeys = uniqueStrings(retryJobs.map((job) => job.sessionKey));
+        for (const sessionKey of sessionKeys) {
+          const sessionJobs = retryJobs.filter((job) => job.sessionKey === sessionKey);
+          const template: MaintenanceContextTemplate = {
+            ...baseTemplate,
+            sessionKey,
+            dbPath: store.client.dbPath,
+            scopes: uniqueStrings([...baseTemplate.scopes, ...sessionJobs.map((job) => job.scope)]),
+          };
+          const key = maintenanceKey(template.agentId, template.dbPath, sessionKey);
+          const existing = this.maintenanceLoops.get(key);
+          if (existing) {
+            await existing;
+          }
+          if (
+            store.auditRepo.listRetryableSemanticWriteJobs({
+              agentId: template.agentId,
+              sessionKey,
+              now: nowIso(),
+              limit: 1,
+            }).length === 0
+          ) {
+            continue;
+          }
+          const upperWatermarks = {
+            event: store.eventRepo.latestObservedAt({
+              agentId: template.agentId,
+              scopes: template.scopes,
+              sessionKey,
+            }),
+            signal: store.auditRepo.latestSignalCreatedAt({
+              agentId: template.agentId,
+              sessionKey,
+            }),
+            task: store.taskRepo.latestUpdatedAt({
+              agentId: template.agentId,
+              scopes: template.scopes,
+              sessionKey,
+            }),
+          };
+          await runAutomaticMaintenanceBatch(store, this.buildMaintenanceContext(template), {
+            sessionKey,
+            turnIds: [],
+            turnCount: 0,
+            reason,
+            lowerWatermarks: {},
+            upperWatermarks,
+          });
+        }
+      }
+    }
+  }
+
   private maintenanceContextForPendingState(
     store: MemxStoreBundle,
     state: { agentId: string; sessionKey: string },
@@ -498,6 +579,13 @@ export class MemxRuntimeManager {
     const vectorRepo = new VectorRepo(client);
     const retrievalBackend = new OptionalEmbeddingBackend(vectorRepo, ctx.config.embedding, this.logger);
     void retrievalBackend.prewarmLocalEmbeddings();
+    const auditRepo = new AuditRepo(client);
+    auditRepo.markExpiredRunningMaintenanceRunsInterrupted({
+      agentId: ctx.agentId,
+      completedAt: nowIso(),
+      startedBefore: new Date(Date.now() - 5 * 60_000).toISOString(),
+      reason: "runtime-startup-expired",
+    });
     const bundle = {
       client,
       stateRepo: new StateRepo(client),
@@ -508,7 +596,7 @@ export class MemxRuntimeManager {
       graphRepo: new GraphRepo(client),
       sourceSegmentRepo: new SourceSegmentRepo(client),
       vectorRepo,
-      auditRepo: new AuditRepo(client),
+      auditRepo,
       maintenanceRepo: new MaintenanceRepo(client),
       beliefRepo: new BeliefRepo(client),
       abstractionRepo: new AbstractionRepo(client),

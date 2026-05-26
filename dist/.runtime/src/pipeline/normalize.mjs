@@ -1,13 +1,14 @@
 import { clamp01, isValidEntityName, normalizeName, normalizeText, normalizedTerms, objectRecord, stableHash, truncateText } from "../support.mjs";
-import { canonicalStateKey } from "./semantic/heuristics.mjs";
 import { isProjectProfileStateKey, projectAliasVariants, projectCodeFromStateKey, projectNamesMatch, resolveProjectReference } from "./projectIdentity.mjs";
-import { sanitizeWorkflowHint, shouldDeriveRelationFact, shouldMaterializePreferenceFact } from "./authority.mjs";
+import { canonicalStateKey } from "./semantic/heuristics.mjs";
 import { sourceRefsFromMaintenanceMetadata, uniqueMaintenanceRefs } from "./maintenanceContract.mjs";
 import { canonicalizePreferenceHint } from "./semantics.mjs";
 import { describeStateValue } from "./memoryObjectsHelpers.mjs";
+import { sanitizeWorkflowHint, shouldDeriveRelationFact, shouldMaterializePreferenceFact } from "./authority.mjs";
+import { canonicalAttributeSlot, normalizeSemanticFactPredicate } from "./attributeSlots.mjs";
+import { redactSensitiveText } from "../security/pii.mjs";
 import { stateCurrentnessVectorMetadata } from "./stateLifecycle.mjs";
 import { buildVectorDocMetadata } from "./vectorDocMetadata.mjs";
-import { redactSensitiveText } from "../security/pii.mjs";
 //#region src/pipeline/normalize.ts
 function subjectUser() {
 	return "user";
@@ -333,6 +334,13 @@ function buildFact(params) {
 }
 function sourceRefForCandidate(candidate) {
 	return typeof candidate.metadata?.sourceRef === "string" && candidate.metadata.sourceRef.trim() ? candidate.metadata.sourceRef.trim() : `${candidate.source.kind}:${candidate.source.messageId ?? candidate.source.runId ?? candidate.candidateId}`;
+}
+function sourceRefRole(sourceRef) {
+	const normalized = sourceRef?.trim().toLowerCase() ?? "";
+	if (normalized.startsWith("user:")) return "user";
+	if (normalized.startsWith("assistant:")) return "assistant";
+	if (normalized.startsWith("tool:")) return "tool";
+	return "unknown";
 }
 function compactResourceKey(value) {
 	return normalizeText(value).replace(/[^\p{L}\p{N}]+/gu, "_").replace(/^_+|_+$/g, "").slice(0, 96);
@@ -866,87 +874,6 @@ function semanticAssertionSupportText(candidate, draft, assertion) {
 function semanticAssertionSubject(assertion) {
 	return (assertion.entityHints?.find((entity) => entity.name.trim()))?.name.trim() || subjectUser();
 }
-const SEMANTIC_FACT_VERB_PREFIXES = new Set([
-	"has",
-	"uses",
-	"prefers",
-	"depends"
-]);
-const CANONICAL_ATTRIBUTE_SLOT_ALIASES = {
-	alertchannel: "alert_channel",
-	alert_channel: "alert_channel",
-	notificationchannel: "alert_channel",
-	notification_channel: "alert_channel",
-	database: "default_database",
-	数据库: "default_database",
-	defaultdatabase: "default_database",
-	default_database: "default_database",
-	defaultdb: "default_database",
-	default_db: "default_database",
-	exportformat: "export_format",
-	export_format: "export_format",
-	outputformat: "export_format",
-	output_format: "export_format",
-	defaultmessagequeue: "default_message_queue",
-	default_message_queue: "default_message_queue",
-	messagequeue: "default_message_queue",
-	message_queue: "default_message_queue",
-	defaultqueue: "default_message_queue",
-	default_queue: "default_message_queue",
-	msgqueue: "queue",
-	msg_queue: "queue",
-	queue: "default_message_queue",
-	消息队列: "default_message_queue",
-	队列: "queue",
-	defaultcache: "default_cache",
-	default_cache: "default_cache",
-	cache: "default_cache",
-	缓存: "default_cache",
-	owner: "owner",
-	provider: "provider",
-	constraint: "constraint"
-};
-const ATTRIBUTE_SLOT_MODIFIER_PREFIXES = new Set([
-	"default",
-	"primary",
-	"main",
-	"current",
-	"selected"
-]);
-const CJK_ATTRIBUTE_SLOT_MODIFIER_PREFIXES = [
-	"默认",
-	"主要",
-	"主",
-	"当前"
-];
-function attributeSlotAlias(slot) {
-	return CANONICAL_ATTRIBUTE_SLOT_ALIASES[slot] ?? CANONICAL_ATTRIBUTE_SLOT_ALIASES[slot.replace(/_/g, "")];
-}
-function stripAttributeSlotModifierPrefix(slot) {
-	const parts = slot.split("_").filter(Boolean);
-	while (parts.length > 1 && ATTRIBUTE_SLOT_MODIFIER_PREFIXES.has(parts[0] ?? "")) parts.shift();
-	let stripped = parts.join("_") || slot;
-	for (const prefix of CJK_ATTRIBUTE_SLOT_MODIFIER_PREFIXES) if (stripped.startsWith(prefix) && stripped.length > prefix.length) {
-		stripped = stripped.slice(prefix.length);
-		break;
-	}
-	return stripped;
-}
-function canonicalAttributeSlot(slot) {
-	const parts = slot.split("_");
-	const tail = SEMANTIC_FACT_VERB_PREFIXES.has(parts[0] ?? "") ? parts.slice(1).join("_") : slot;
-	return attributeSlotAlias(tail) ?? attributeSlotAlias(stripAttributeSlotModifierPrefix(tail));
-}
-function normalizeSemanticFactPredicate(value) {
-	const raw = value?.trim();
-	if (!raw) return;
-	const slot = (raw.split(/[.:/#|]+/u).map((entry) => entry.trim()).filter(Boolean).at(-1) ?? raw).normalize("NFKC").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "_").replace(/_+/g, "_").replace(/^_+|_+$/g, "");
-	if (!slot) return;
-	const attributeSlot = canonicalAttributeSlot(slot);
-	if (attributeSlot) return `has_${attributeSlot}`;
-	const verb = slot.split("_")[0];
-	return SEMANTIC_FACT_VERB_PREFIXES.has(verb) ? slot : `has_${slot}`;
-}
 function semanticAssertionSlots(assertion) {
 	const seen = /* @__PURE__ */ new Set();
 	const slots = [];
@@ -965,8 +892,46 @@ function semanticAssertionObjectForSlot(params) {
 	if (params.hasExplicitSlot) return objectEntities[params.slotIndex] ?? objectEntities[0] ?? params.supportText;
 	return params.supportText;
 }
+function entityTypeFromSemanticHint(type) {
+	switch (type) {
+		case "person":
+		case "project":
+		case "tool":
+		case "service":
+		case "language":
+		case "framework":
+		case "concept":
+		case "organization":
+		case "unknown": return type;
+		default: return;
+	}
+}
+function semanticEntityHintForName(assertion, name) {
+	const normalized = normalizeName(name ?? "");
+	if (!normalized) return;
+	for (const hint of assertion.entityHints ?? []) {
+		const hintName = hint.name.trim();
+		if (!hintName || normalizeName(hintName) !== normalized) continue;
+		return {
+			name: hintName,
+			...entityTypeFromSemanticHint(hint.type) ? { type: entityTypeFromSemanticHint(hint.type) } : {}
+		};
+	}
+}
+function semanticObjectEntityHint(params) {
+	const subjectName = normalizeName(params.subject);
+	const objectName = normalizeName(params.object);
+	if (!objectName || objectName === subjectName) return;
+	const exact = semanticEntityHintForName(params.assertion, params.object);
+	if (exact) return exact;
+	if (params.assertion.valueHint?.trim()) return;
+	return (params.assertion.entityHints ?? []).map((hint) => ({
+		name: hint.name.trim(),
+		type: entityTypeFromSemanticHint(hint.type)
+	})).find((hint) => hint.name && normalizeName(hint.name) !== subjectName);
+}
 function shouldMaterializeSemanticAssertionFact(params) {
-	if (params.candidate.classification !== "stable-fact" || params.assertion.familyHint !== "fact_like" || params.preference || params.decision || params.correction || params.workflowHints.length > 0 || (params.candidate.structuredHints?.resourceAssertions?.length ?? 0) > 0 || (params.candidate.structuredHints?.adviceSignals?.length ?? 0) > 0) return false;
+	if (params.candidate.classification !== "stable-fact" || params.assertion.familyHint !== "fact_like" || sourceRefRole(params.assertion.sourceRef) === "assistant" || params.preference || params.decision || params.correction || params.workflowHints.length > 0 || (params.candidate.structuredHints?.resourceAssertions?.length ?? 0) > 0 || (params.candidate.structuredHints?.adviceSignals?.length ?? 0) > 0) return false;
 	return Boolean(semanticAssertionSubject(params.assertion));
 }
 function buildSemanticAssertionFacts(ctx, candidate, draft, assertion) {
@@ -1137,7 +1102,7 @@ function normalizeCandidate(candidate, ctx) {
 		currentProject,
 		knownProjects: knownProjectNames
 	}) : void 0;
-	const relations = getRelationHints(candidate).map((relation) => {
+	const relations = getRelationHints(candidate).filter((relation) => sourceRefRole(relation.sourceRef) !== "assistant").map((relation) => {
 		const canonicalSubject = resolveProjectReference(relation.subject, {
 			currentProject: canonicalCurrentProject,
 			knownProjects: knownProjectNames,
@@ -1233,6 +1198,107 @@ function normalizeCandidate(candidate, ctx) {
 				sourceRef: params.sourceRef
 			}
 		}));
+	};
+	const pushAttributeSlotEdgeFromSemanticAssertion = (params) => {
+		const slot = canonicalAttributeSlot(params.predicate);
+		if (!slot || sourceRefRole(params.sourceRef) === "assistant") return;
+		const objectHint = semanticObjectEntityHint({
+			assertion: params.assertion,
+			subject: params.subject,
+			object: params.object
+		});
+		if (!objectHint) return;
+		const subjectHint = semanticEntityHintForName(params.assertion, params.subject);
+		const srcEntity = pushEntity(params.subject, subjectHint?.type ?? (params.subject === subjectUser() ? "person" : void 0), subjectHint?.type === "project" ? projectAliasVariants(params.subject) : []);
+		const dstEntity = pushEntity(objectHint.name || params.object, objectHint.type);
+		if (!srcEntity || !dstEntity) return;
+		const edgeId = stableHash([
+			ctx.agentId,
+			candidate.scope,
+			srcEntity.entityId,
+			"uses",
+			slot,
+			dstEntity.entityId
+		]);
+		if (outputs.edges.some((edge) => edge.edgeId === edgeId)) return;
+		outputs.edges.push({
+			edgeId,
+			srcEntityId: srcEntity.entityId,
+			relType: "uses",
+			relationSlot: slot,
+			dstEntityId: dstEntity.entityId,
+			scope: candidate.scope,
+			agentId: ctx.agentId,
+			confidence: params.confidence ?? candidate.confidence,
+			validFrom: candidate.observedAt,
+			evidenceRef: params.sourceRef,
+			rawRelationType: params.predicate,
+			sourceKind: "extracted",
+			createdAt: candidate.observedAt,
+			updatedAt: candidate.observedAt,
+			metadataJson: {
+				sourceRefs: [params.sourceRef],
+				supportRefs: [params.sourceRef],
+				relationType: "uses",
+				relationSlot: slot,
+				rawPredicate: params.predicate,
+				sourceKind: "llm_semantic_assertion",
+				semanticAssertion: {
+					draftId: params.assertion.draftId,
+					familyHint: params.assertion.familyHint,
+					timeframeHint: params.assertion.timeframeHint,
+					supportText: params.supportText
+				}
+			}
+		});
+	};
+	const pushAttributeSlotEdgeFromSemanticCorrection = (params) => {
+		const slot = canonicalAttributeSlot(params.predicate);
+		if (!slot || sourceRefRole(params.sourceRef) === "assistant") return;
+		const srcEntity = pushEntity(params.subject, params.subject === subjectUser() ? "person" : void 0);
+		const dstEntity = pushEntity(params.object);
+		if (!srcEntity || !dstEntity) return;
+		const edgeId = stableHash([
+			ctx.agentId,
+			candidate.scope,
+			srcEntity.entityId,
+			"uses",
+			slot,
+			dstEntity.entityId
+		]);
+		if (outputs.edges.some((edge) => edge.edgeId === edgeId)) return;
+		outputs.edges.push({
+			edgeId,
+			srcEntityId: srcEntity.entityId,
+			relType: "uses",
+			relationSlot: slot,
+			dstEntityId: dstEntity.entityId,
+			scope: candidate.scope,
+			agentId: ctx.agentId,
+			confidence: params.confidence ?? candidate.confidence,
+			validFrom: candidate.observedAt,
+			evidenceRef: params.sourceRef,
+			rawRelationType: params.predicate,
+			sourceKind: "extracted",
+			createdAt: candidate.observedAt,
+			updatedAt: candidate.observedAt,
+			metadataJson: {
+				sourceRefs: [params.sourceRef],
+				supportRefs: [params.sourceRef],
+				relationType: "uses",
+				relationSlot: slot,
+				rawPredicate: params.predicate,
+				sourceKind: "llm_semantic_correction",
+				correction: {
+					timeframe: params.correction.timeframe,
+					targetKind: params.correction.targetKind,
+					...params.correction.canonicalKey ? { canonicalKey: params.correction.canonicalKey } : {},
+					...params.correction.priorValue ? { priorValue: params.correction.priorValue } : {},
+					nextValue: params.object,
+					supportText: params.supportText
+				}
+			}
+		});
 	};
 	const pushResourceAssertion = (assertion) => {
 		const fact = buildResourceFact(ctx, candidate, assertion);
@@ -1358,31 +1424,52 @@ function normalizeCandidate(candidate, ctx) {
 	const materializationHint = getMaterializationHint(candidate);
 	const semanticDraft = getSemanticDraft(candidate);
 	if (correction && correction.targetKind === "fact" && correction.nextValue?.trim() && (!correction.priorValue || normalizeText(correction.priorValue) !== normalizeText(correction.nextValue.trim()))) {
-		const correctionAssertions = relatedCorrectionAssertions(semanticDraft, semanticDraft?.correctionDrafts[0]?.sourceRef ?? sourceRefForCandidate(candidate));
-		const predicate = correctionPredicate(correction, correctionAssertions);
-		const correctionFact = buildFact({
-			ctx,
-			candidate,
-			subject: correctionSubject(correction, correctionAssertions),
-			predicate: predicate ?? "reported_detail",
-			object: correction.nextValue.trim(),
-			objectValueJson: {
-				correction: {
-					timeframe: correction.timeframe,
-					...correction.priorValue ? { priorValue: correction.priorValue } : {},
-					nextValue: correction.nextValue.trim()
-				},
-				replacement: {
-					mode: materializationHint?.replacementMode ?? "none",
-					targetKind: correction.targetKind,
-					...predicate ? { predicate } : {},
-					...correction.canonicalKey ? { canonicalKey: correction.canonicalKey } : {},
-					...correction.priorValue ? { priorValue: correction.priorValue } : {},
-					nextValue: correction.nextValue.trim()
+		const correctionSourceRef = semanticDraft?.correctionDrafts[0]?.sourceRef ?? sourceRefForCandidate(candidate);
+		if (sourceRefRole(correctionSourceRef) !== "assistant") {
+			const correctionAssertions = relatedCorrectionAssertions(semanticDraft, correctionSourceRef);
+			const predicate = correctionPredicate(correction, correctionAssertions);
+			const correctionFact = buildFact({
+				ctx,
+				candidate,
+				subject: correctionSubject(correction, correctionAssertions),
+				predicate: predicate ?? "reported_detail",
+				object: correction.nextValue.trim(),
+				objectValueJson: {
+					correction: {
+						timeframe: correction.timeframe,
+						...correction.priorValue ? { priorValue: correction.priorValue } : {},
+						nextValue: correction.nextValue.trim()
+					},
+					replacement: {
+						mode: materializationHint?.replacementMode ?? "none",
+						targetKind: correction.targetKind,
+						...predicate ? { predicate } : {},
+						...correction.canonicalKey ? { canonicalKey: correction.canonicalKey } : {},
+						...correction.priorValue ? { priorValue: correction.priorValue } : {},
+						nextValue: correction.nextValue.trim()
+					}
 				}
-			}
-		});
-		if (!outputs.facts.some((entry) => entry.canonicalSubject === correctionFact.canonicalSubject && entry.predicate === correctionFact.predicate && entry.canonicalObject === correctionFact.canonicalObject)) outputs.facts.push(correctionFact);
+			});
+			if (!outputs.facts.some((entry) => entry.canonicalSubject === correctionFact.canonicalSubject && entry.predicate === correctionFact.predicate && entry.canonicalObject === correctionFact.canonicalObject)) outputs.facts.push(correctionFact);
+			pushAttributeSlotEdgeFromSemanticCorrection({
+				correction,
+				subject: correctionFact.canonicalSubject,
+				predicate: correctionFact.predicate,
+				object: correction.nextValue.trim(),
+				sourceRef: correctionSourceRef,
+				supportText: correctionFact.provenanceText ?? candidate.rawText,
+				confidence: correction.confidence
+			});
+			for (const assertion of correctionAssertions) pushAttributeSlotEdgeFromSemanticAssertion({
+				assertion,
+				subject: correctionSubject(correction, correctionAssertions),
+				predicate: predicate ?? correctionFact.predicate,
+				object: correction.nextValue.trim(),
+				sourceRef: correctionSourceRef,
+				supportText: semanticAssertionSupportText(candidate, semanticDraft, assertion),
+				confidence: correction.confidence ?? assertion.confidence
+			});
+		}
 	}
 	const procedureGuidanceFact = buildProcedureGuidanceFact(ctx, candidate);
 	if (procedureGuidanceFact) outputs.facts.push(procedureGuidanceFact);
@@ -1408,7 +1495,18 @@ function normalizeCandidate(candidate, ctx) {
 			correction,
 			workflowHints
 		})) continue;
-		for (const assertionFact of buildSemanticAssertionFacts(ctx, candidate, semanticDraft, assertion)) if (!outputs.facts.some((entry) => entry.predicate === assertionFact.predicate && entry.canonicalSubject === assertionFact.canonicalSubject && entry.canonicalObject === assertionFact.canonicalObject && entry.sourceRef === assertionFact.sourceRef)) outputs.facts.push(assertionFact);
+		for (const assertionFact of buildSemanticAssertionFacts(ctx, candidate, semanticDraft, assertion)) {
+			if (!outputs.facts.some((entry) => entry.predicate === assertionFact.predicate && entry.canonicalSubject === assertionFact.canonicalSubject && entry.canonicalObject === assertionFact.canonicalObject && entry.sourceRef === assertionFact.sourceRef)) outputs.facts.push(assertionFact);
+			pushAttributeSlotEdgeFromSemanticAssertion({
+				assertion,
+				subject: assertionFact.canonicalSubject,
+				predicate: assertionFact.predicate,
+				object: assertionFact.canonicalObject ?? "",
+				sourceRef: assertionFact.sourceRef,
+				supportText: assertionFact.provenanceText ?? candidate.rawText,
+				confidence: assertion.confidence
+			});
+		}
 	}
 	for (const workflow of workflowHints) {
 		const canonicalProjectCode = projectCodeFromStateKey(workflow.key) || (typeof workflow.value.projectCode === "string" ? workflow.value.projectCode.trim() : void 0);

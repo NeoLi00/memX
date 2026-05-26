@@ -1,24 +1,24 @@
 import { clamp01, normalizeText, objectRecord, randomId, stableHash, truncateText } from "../support.mjs";
-import { inferWriteLlmStage, recordMemoryLlmBudgetCall, snapshotMemoryLlmBudgetAudit } from "./llmBudgetAudit.mjs";
-import { isProjectProfileStateKey, projectCodeFromStateKey, projectIdentityKey, projectNamesMatch, resolveProjectReference } from "./projectIdentity.mjs";
-import { sanitizeTaskMetadata } from "./authority.mjs";
-import { semanticTextSimilarity } from "./semantic/textSimilarity.mjs";
-import { containsLikelySecret, looksLikePromptInjection } from "../security/injection.mjs";
-import { CHUNK_VECTOR_CONFIDENCE, SCHEDULER_DEDUP_PROBE_FLOOR, SCHEDULER_DEDUP_PROBE_SCALE, SCHEDULER_SUMMARY_SCORE_BOOST, TASK_VECTOR_CONFIDENCE } from "./constants.mjs";
-import { resolveWorkingTaskSummary, semanticTaskSummaryText } from "./taskSummary.mjs";
-import { emitAssistantOutcomeLearningSignals, emitOutcomeFeedbackSignal } from "./signalLedger.mjs";
-import { buildVectorDocMetadata } from "./vectorDocMetadata.mjs";
-import { buildSourceSegmentVectorDocs, buildSourceSegmentsForChunk } from "./sourceSegments.mjs";
 import { eligibleForLlmRefinement } from "./abstractionRefinement.mjs";
+import { isProjectProfileStateKey, projectCodeFromStateKey, projectIdentityKey, projectNamesMatch, resolveProjectReference } from "./projectIdentity.mjs";
+import { semanticTextSimilarity } from "./semantic/textSimilarity.mjs";
+import { inferWriteLlmStage, recordMemoryLlmBudgetCall, snapshotMemoryLlmBudgetAudit } from "./llmBudgetAudit.mjs";
+import { containsLikelySecret, looksLikePromptInjection } from "../security/injection.mjs";
 import { assessAssistantChunk, assistantVectorSummary, assistantVectorText } from "./sourceWeighting.mjs";
 import { buildOutcomeHypothesisCandidate, isAuthoritativeOutcomeResolutionMetadata } from "./outcomeHypotheses.mjs";
+import { sanitizeTaskMetadata } from "./authority.mjs";
 import { containsSensitiveValue, sensitivityScore } from "../security/pii.mjs";
+import { buildVectorDocMetadata } from "./vectorDocMetadata.mjs";
 import { computeConfidence } from "./normalize.mjs";
-import { writeCandidate } from "./write.mjs";
+import { emitAssistantOutcomeLearningSignals, emitOutcomeFeedbackSignal } from "./signalLedger.mjs";
+import { policyAuditSourceMetadata, writeCandidate } from "./write.mjs";
+import { CHUNK_VECTOR_CONFIDENCE, SCHEDULER_DEDUP_PROBE_FLOOR, SCHEDULER_DEDUP_PROBE_SCALE, SCHEDULER_SUMMARY_SCORE_BOOST, TASK_VECTOR_CONFIDENCE } from "./constants.mjs";
+import { resolveWorkingTaskSummary, semanticTaskSummaryText } from "./taskSummary.mjs";
+import { compileTurnSemantics, frameHintsForSourceRef } from "./turnSemanticCompiler.mjs";
 import { classifyAction } from "./classify.mjs";
 import { evaluatePolicy } from "./policy.mjs";
-import { compileTurnSemantics, frameHintsForSourceRef } from "./turnSemanticCompiler.mjs";
 import { buildCandidate } from "./extract.mjs";
+import { buildSourceSegmentVectorDocs, buildSourceSegmentsForChunk } from "./sourceSegments.mjs";
 import { decideTaskAssignment } from "./taskJudge.mjs";
 //#region src/pipeline/turnScheduler.ts
 function buildOutcomeKey(taskId, proposal) {
@@ -239,7 +239,10 @@ function buildChunkVectorDoc(chunk, taskChunks) {
 					assistantWeight: Number(assistantAssessment.weight.toFixed(3)),
 					assistantGrounding: Number(assistantAssessment.grounding.toFixed(3)),
 					assistantComplexity: Number(assistantAssessment.complexity.toFixed(3)),
-					assistantSummaryOnly: assistantAssessment.useSummaryOnly
+					assistantSummaryOnly: assistantAssessment.useSummaryOnly,
+					semanticRole: assistantAssessment.semanticRole,
+					memoryClass: assistantAssessment.memoryClass,
+					recallVisibility: assistantAssessment.recallVisibility
 				} : {}
 			}
 		}),
@@ -354,6 +357,30 @@ function resolveCurrentProjectContext(params) {
 		currentProject,
 		currentProjectProfile
 	} : { currentProject };
+}
+function turnSourceRefs(messages) {
+	return [...new Set(messages.map((message) => message.sourceRef).filter((entry) => Boolean(entry?.trim())))];
+}
+function turnSemanticInputHash(messages) {
+	return stableHash(messages.map((message) => [
+		message.role,
+		message.sourceRef,
+		normalizeText(message.content)
+	].join("")));
+}
+function semanticFrameDraftCounts(frame) {
+	return {
+		assertionDrafts: frame?.assertionDrafts?.length ?? 0,
+		correctionDrafts: frame?.correctionDrafts?.length ?? 0,
+		relationDrafts: frame?.relationDrafts?.length ?? 0,
+		resourceAssertions: frame?.resourceAssertions?.length ?? 0,
+		adviceSignals: frame?.adviceSignals?.length ?? 0,
+		supportSpans: frame?.supportSpans?.length ?? 0
+	};
+}
+function semanticFrameResolvedByLlm(frame) {
+	const provenance = objectRecord(frame?.compilerProvenance);
+	return provenance?.source === "llm" && provenance.mode !== "fallback";
 }
 var MemxTurnScheduler = class {
 	store;
@@ -575,14 +602,75 @@ var MemxTurnScheduler = class {
 			includeSkipped: false
 		});
 		const recentChunksByTask = Object.fromEntries(recentTasks.map((task) => [task.taskId, this.store.chunkRepo.listByTask(task.taskId)]));
-		const turnSemanticFrame = await compileTurnSemantics({
-			messages: safeMessages,
-			ctx,
-			activeTask,
-			activeChunks,
-			recentTasks,
-			recentChunksByTask,
-			reasoner: this.store.reasoner
+		const semanticJobSourceRefs = turnSourceRefs(safeMessages);
+		const semanticJobInputHash = turnSemanticInputHash(safeMessages);
+		const semanticJobTurnId = safeMessages[0].turnId;
+		const semanticJobScope = safeMessages[0].scope ?? scope;
+		if (ctx.config.advanced.enableTurnSemanticCompiler) this.store.auditRepo.recordSemanticWriteAttemptStart({
+			agentId: ctx.agentId,
+			sessionKey: safeMessages[0].sessionKey,
+			scope: semanticJobScope,
+			turnId: semanticJobTurnId,
+			sourceRefs: semanticJobSourceRefs,
+			inputHash: semanticJobInputHash,
+			startedAt: ctx.now
+		});
+		let turnSemanticFrame;
+		try {
+			turnSemanticFrame = await compileTurnSemantics({
+				messages: safeMessages,
+				ctx,
+				activeTask,
+				activeChunks,
+				recentTasks,
+				recentChunksByTask,
+				reasoner: this.store.reasoner
+			});
+		} catch (error) {
+			this.store.auditRepo.finishSemanticWriteAttempt({
+				agentId: ctx.agentId,
+				sessionKey: safeMessages[0].sessionKey,
+				turnId: semanticJobTurnId,
+				status: "retrying",
+				error: `turn semantic compiler failed: ${error instanceof Error ? error.message : String(error)}`,
+				resultJson: {
+					stage: "write_hot_path",
+					sourceRefs: semanticJobSourceRefs,
+					llmBudget: snapshotMemoryLlmBudgetAudit(ctx.llmBudgetAudit)
+				},
+				completedAt: ctx.now
+			});
+			this.logger.warn(`memx: turn semantic compiler failed for turn ${semanticJobTurnId}: ${String(error)}`);
+		}
+		if (ctx.config.advanced.enableTurnSemanticCompiler && turnSemanticFrame) {
+			const resolvedByLlm = semanticFrameResolvedByLlm(turnSemanticFrame);
+			this.store.auditRepo.finishSemanticWriteAttempt({
+				agentId: ctx.agentId,
+				sessionKey: safeMessages[0].sessionKey,
+				turnId: semanticJobTurnId,
+				status: resolvedByLlm ? "succeeded" : "retrying",
+				error: resolvedByLlm ? void 0 : "turn semantic compiler returned no recognized LLM semantic frame",
+				resultJson: {
+					stage: "write_hot_path",
+					sourceRefs: semanticJobSourceRefs,
+					compilerProvenance: turnSemanticFrame.compilerProvenance,
+					...semanticFrameDraftCounts(turnSemanticFrame),
+					llmBudget: snapshotMemoryLlmBudgetAudit(ctx.llmBudgetAudit)
+				},
+				completedAt: ctx.now
+			});
+		} else if (ctx.config.advanced.enableTurnSemanticCompiler) this.store.auditRepo.finishSemanticWriteAttempt({
+			agentId: ctx.agentId,
+			sessionKey: safeMessages[0].sessionKey,
+			turnId: semanticJobTurnId,
+			status: "retrying",
+			error: "turn semantic compiler returned no recognized LLM semantic frame",
+			resultJson: {
+				stage: "write_hot_path",
+				sourceRefs: semanticJobSourceRefs,
+				llmBudget: snapshotMemoryLlmBudgetAudit(ctx.llmBudgetAudit)
+			},
+			completedAt: ctx.now
 		});
 		const taskProposal = turnSemanticFrame?.taskProposal;
 		const assignment = await decideTaskAssignment({
@@ -775,12 +863,13 @@ var MemxTurnScheduler = class {
 		if (classification === "ignore") {
 			if (ctx.config.advanced.enableTelemetryAudit) this.store.auditRepo.recordPolicyDecision({
 				agentId: ctx.agentId,
+				sessionKey: ctx.sessionKey,
 				sourceRef: `${candidate.source.kind}:rejected:${candidate.candidateId}`,
 				candidateText: candidate.rawText,
 				decision: policyResult.decision,
 				createdAt: message.observedAt,
 				metadataJson: {
-					decisionSource: "deterministic",
+					...policyAuditSourceMetadata(policyResult.candidate),
 					turnSemanticCompile: turnSemanticFrame?.compilerProvenance,
 					turnSemanticFrame,
 					semanticDraftConsumed: policyResult.candidate.structuredHints?.semanticDraft ? {

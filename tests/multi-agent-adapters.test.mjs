@@ -418,7 +418,12 @@ test("Codex Stop hook writes a complete pending user and assistant turn", async 
     });
     res.writeHead(200, { "content-type": "application/json" });
     if (req.url === "/v1/context") {
-      res.end(JSON.stringify({ ok: true, prependContext: "" }));
+      res.end(
+        JSON.stringify({
+          ok: true,
+          prependContext: "## memX Memory\n- notebook validator prefers pytest fixtures",
+        }),
+      );
       return;
     }
     res.end(JSON.stringify({ ok: true }));
@@ -482,6 +487,10 @@ test("Codex Stop hook writes a complete pending user and assistant turn", async 
   );
   assert.match(observe.messages[0].content, /notebook validator/);
   assert.match(observe.messages[1].content, /pytest fixtures/);
+  assert.deepEqual(observe.metadata.memxRecall.injectedTexts, [
+    "## memX Memory\n- notebook validator prefers pytest fixtures",
+    "notebook validator prefers pytest fixtures",
+  ]);
 });
 
 test("Stop hook completes pending turns from Codex and Claude transcripts", async () => {
@@ -615,6 +624,124 @@ test("Stop hook completes pending turns from Codex and Claude transcripts", asyn
   assert.match(observes[1].messages[1].content, /Pulsar/);
   assert.equal(observes[0].metadata.transcriptAssistantCapture, "codex");
   assert.equal(observes[1].metadata.transcriptAssistantCapture, "claude-code");
+});
+
+test("Claude Stop hook uses the pending transcript path when Stop payload omits it", async () => {
+  const calls = [];
+  const server = createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) {
+      chunks.push(chunk);
+    }
+    const bodyText = Buffer.concat(chunks).toString("utf8");
+    calls.push({
+      path: req.url,
+      body: bodyText ? JSON.parse(bodyText) : {},
+    });
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true }));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const pendingDir = mkdtempSync(join(tmpdir(), "memx-claude-pending-transcript-"));
+  const env = {
+    ...process.env,
+    MEMX_URL: `http://127.0.0.1:${address.port}`,
+    MEMX_HOOK_TIMEOUT_MS: "2000",
+    MEMX_PENDING_DIR: pendingDir,
+  };
+
+  async function runHook(eventName, payload) {
+    const child = spawn(process.execPath, [join(rootPath, "dist/.runtime/src/bin/memx-hook.mjs"), "claude-code", eventName], {
+      env,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stderr = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.stdin.end(JSON.stringify(payload));
+    const exitCode = await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        child.kill("SIGKILL");
+        reject(new Error(`memx-hook claude-code ${eventName} test timed out`));
+      }, 5000);
+      child.on("error", (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+      child.on("exit", (code) => {
+        clearTimeout(timeout);
+        resolve(code);
+      });
+    });
+    assert.equal(exitCode, 0, stderr);
+  }
+
+  const claudeTranscript = join(pendingDir, "claude-real-format.jsonl");
+  writeFileSync(
+    claudeTranscript,
+    [
+      JSON.stringify({
+        type: "queue-operation",
+        operation: "enqueue",
+        sessionId: "claude-real-transcript-session",
+        content: "不用查看文件。请只回复：收到",
+      }),
+      JSON.stringify({
+        type: "user",
+        message: { role: "user", content: "不用查看文件。请只回复：收到" },
+        sessionId: "claude-real-transcript-session",
+      }),
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          role: "assistant",
+          content: [{ type: "thinking", thinking: "The user asked for a short acknowledgment." }],
+        },
+        sessionId: "claude-real-transcript-session",
+      }),
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "收到" }],
+        },
+        sessionId: "claude-real-transcript-session",
+      }),
+      JSON.stringify({
+        type: "last-prompt",
+        lastPrompt: "不用查看文件。请只回复：收到",
+        sessionId: "claude-real-transcript-session",
+      }),
+    ].join("\n"),
+    "utf8",
+  );
+
+  await runHook("UserPromptSubmit", {
+    session_id: "claude-real-transcript-session",
+    cwd: "/tmp/project",
+    prompt: "不用查看文件。请只回复：收到",
+    transcript_path: claudeTranscript,
+  });
+  await runHook("Stop", {
+    session_id: "claude-real-transcript-session",
+    cwd: "/tmp/project",
+  });
+  await new Promise((resolve) => server.close(resolve));
+
+  const observes = calls.filter((call) => call.path === "/v1/observe").map((call) => call.body);
+  assert.equal(observes.length, 1);
+  assert.deepEqual(
+    observes[0].messages.map((message) => message.role),
+    ["user", "assistant"],
+  );
+  assert.equal(observes[0].messages[1].content, "收到");
+  assert.equal(observes[0].metadata.transcriptPath, claudeTranscript);
+  assert.equal(observes[0].metadata.transcriptAssistantCapture, "claude-code");
+  assert.deepEqual(readdirSync(pendingDir).filter((name) => name.endsWith(".json")), []);
 });
 
 test("Stop hook waits briefly for Claude transcript assistant before writing the completed turn", async () => {
@@ -794,6 +921,255 @@ test("Stop hook keeps pending turns out of memory when assistant output is unava
   await new Promise((resolve) => server.close(resolve));
 
   assert.deepEqual(calls.map((call) => call.path), ["/v1/context"]);
+});
+
+test("pending user turns are queued instead of overwritten when a Stop lacks assistant output", async () => {
+  const calls = [];
+  const server = createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) {
+      chunks.push(chunk);
+    }
+    const bodyText = Buffer.concat(chunks).toString("utf8");
+    calls.push({
+      path: req.url,
+      body: bodyText ? JSON.parse(bodyText) : {},
+    });
+    res.writeHead(200, { "content-type": "application/json" });
+    if (req.url === "/v1/context") {
+      res.end(JSON.stringify({ ok: true, prependContext: "" }));
+      return;
+    }
+    res.end(JSON.stringify({ ok: true }));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const pendingDir = mkdtempSync(join(tmpdir(), "memx-pending-queue-"));
+  const env = {
+    ...process.env,
+    MEMX_URL: `http://127.0.0.1:${address.port}`,
+    MEMX_HOOK_TIMEOUT_MS: "2000",
+    MEMX_PENDING_DIR: pendingDir,
+  };
+
+  async function runHook(eventName, payload) {
+    const child = spawn(process.execPath, [join(rootPath, "dist/.runtime/src/bin/memx-hook.mjs"), "codex", eventName], {
+      env,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stderr = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.stdin.end(JSON.stringify(payload));
+    const exitCode = await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        child.kill("SIGKILL");
+        reject(new Error(`memx-hook queued ${eventName} test timed out`));
+      }, 5000);
+      child.on("error", (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+      child.on("exit", (code) => {
+        clearTimeout(timeout);
+        resolve(code);
+      });
+    });
+    assert.equal(exitCode, 0, stderr);
+  }
+
+  await runHook("UserPromptSubmit", {
+    session_id: "queued-session",
+    cwd: "/tmp/project",
+    timestamp: "2026-05-26T10:00:00.000Z",
+    prompt: "记住 QueueProbeOne 默认队列是 Kafka",
+  });
+  await runHook("Stop", {
+    session_id: "queued-session",
+    cwd: "/tmp/project",
+  });
+  await runHook("UserPromptSubmit", {
+    session_id: "queued-session",
+    cwd: "/tmp/project",
+    timestamp: "2026-05-26T10:01:00.000Z",
+    prompt: "记住 QueueProbeTwo 默认队列是 Pulsar",
+  });
+  await runHook("Stop", {
+    session_id: "queued-session",
+    cwd: "/tmp/project",
+    assistant_response: "已记录 QueueProbeTwo 默认队列是 Pulsar。",
+  });
+  await new Promise((resolve) => server.close(resolve));
+
+  const observes = calls.filter((call) => call.path === "/v1/observe").map((call) => call.body);
+  assert.equal(observes.length, 1);
+  assert.match(observes[0].messages[0].content, /QueueProbeTwo/);
+  assert.doesNotMatch(observes[0].messages[0].content, /QueueProbeOne/);
+  const pendingFile = readdirSync(pendingDir).find((name) => name.endsWith(".json"));
+  assert.ok(pendingFile, "first pending turn should remain queued for a later transcript/session flush");
+  const pending = JSON.parse(readFileSync(join(pendingDir, pendingFile), "utf8"));
+  assert.equal(pending.pendingTurns.length, 1);
+  assert.match(pending.pendingTurns[0].messages[0].content, /QueueProbeOne/);
+});
+
+test("next prompt flushes an earlier pending turn after transcript assistant appears late", async () => {
+  const calls = [];
+  const server = createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) {
+      chunks.push(chunk);
+    }
+    const bodyText = Buffer.concat(chunks).toString("utf8");
+    calls.push({
+      path: req.url,
+      body: bodyText ? JSON.parse(bodyText) : {},
+    });
+    res.writeHead(200, { "content-type": "application/json" });
+    if (req.url === "/v1/context") {
+      res.end(JSON.stringify({ ok: true, prependContext: "" }));
+      return;
+    }
+    res.end(JSON.stringify({ ok: true }));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const pendingDir = mkdtempSync(join(tmpdir(), "memx-late-assistant-flush-"));
+  const env = {
+    ...process.env,
+    MEMX_URL: `http://127.0.0.1:${address.port}`,
+    MEMX_HOOK_TIMEOUT_MS: "2500",
+    MEMX_TRANSCRIPT_CAPTURE_TIMEOUT_MS: "0",
+    MEMX_PENDING_DIR: pendingDir,
+  };
+
+  async function runHook(eventName, payload) {
+    const child = spawn(process.execPath, [join(rootPath, "dist/.runtime/src/bin/memx-hook.mjs"), "claude-code", eventName], {
+      env,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stderr = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.stdin.end(JSON.stringify(payload));
+    const exitCode = await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        child.kill("SIGKILL");
+        reject(new Error(`memx-hook late assistant ${eventName} test timed out`));
+      }, 5000);
+      child.on("error", (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+      child.on("exit", (code) => {
+        clearTimeout(timeout);
+        resolve(code);
+      });
+    });
+    assert.equal(exitCode, 0, stderr);
+  }
+
+  const transcript = join(pendingDir, "late-output.jsonl");
+  writeFileSync(
+    transcript,
+    `${JSON.stringify({
+      type: "user",
+      message: { role: "user", content: "继续 LateAssistantLedger 任务" },
+    })}\n`,
+    "utf8",
+  );
+  await runHook("UserPromptSubmit", {
+    session_id: "late-assistant-session",
+    cwd: "/tmp/project",
+    prompt: "继续 LateAssistantLedger 任务",
+  });
+  await runHook("Stop", {
+    session_id: "late-assistant-session",
+    cwd: "/tmp/project",
+    transcript_path: transcript,
+  });
+  appendFileSync(
+    transcript,
+    `${JSON.stringify({
+      type: "assistant",
+      message: { role: "assistant", content: "已完成 LateAssistantLedger 的任务总结。" },
+    })}\n`,
+    "utf8",
+  );
+  await runHook("UserPromptSubmit", {
+    session_id: "late-assistant-session",
+    cwd: "/tmp/project",
+    prompt: "现在继续下一个自然任务",
+  });
+  await new Promise((resolve) => server.close(resolve));
+
+  const observes = calls.filter((call) => call.path === "/v1/observe").map((call) => call.body);
+  assert.equal(observes.length, 1);
+  assert.match(observes[0].messages[0].content, /LateAssistantLedger/);
+  assert.match(observes[0].messages[1].content, /任务总结/);
+  assert.doesNotMatch(JSON.stringify(observes[0].messages), /现在继续下一个自然任务/);
+  const pendingFile = readdirSync(pendingDir).find((name) => name.endsWith(".json"));
+  assert.ok(pendingFile, "the new prompt should remain pending for its own Stop hook");
+  const pending = JSON.parse(readFileSync(join(pendingDir, pendingFile), "utf8"));
+  assert.equal(pending.pendingTurns.length, 1);
+  assert.match(pending.pendingTurns[0].messages[0].content, /现在继续下一个自然任务/);
+});
+
+test("PreToolUse denies attempts to use host-native memory stores instead of memX lifecycle memory", async () => {
+  const child = spawn(process.execPath, [join(rootPath, "dist/.runtime/src/bin/memx-hook.mjs"), "codex", "PreToolUse"], {
+    env: {
+      ...process.env,
+      MEMX_URL: "http://127.0.0.1:9",
+      MEMX_HOOK_TIMEOUT_MS: "2000",
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    stdout += chunk;
+  });
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+  child.stdin.end(
+    JSON.stringify({
+      session_id: "codex-native-memory-bypass",
+      cwd: "/tmp/project",
+      tool_name: "exec_command",
+      tool_input: {
+        cmd: 'mkdir -p "$HOME/.codex/memories" && printf "RiverMap uses Kafka" >> "$HOME/.codex/memories/user_facts.txt"',
+      },
+    }),
+  );
+
+  const exitCode = await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error("memx-hook PreToolUse bypass guard test timed out"));
+    }, 5000);
+    child.on("error", (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+    child.on("exit", (code) => {
+      clearTimeout(timeout);
+      resolve(code);
+    });
+  });
+
+  assert.equal(exitCode, 0, stderr);
+  const output = JSON.parse(stdout);
+  assert.equal(output.hookSpecificOutput.hookEventName, "PreToolUse");
+  assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(output.hookSpecificOutput.permissionDecisionReason, /memX/i);
 });
 
 test("Codex UserPromptSubmit hook recalls before observing the current prompt", async () => {

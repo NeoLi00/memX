@@ -9,6 +9,10 @@ import type {
   VectorDocRecord,
 } from "../types.js";
 import { shouldDeriveProjectProfileArtifacts } from "./authority.js";
+import {
+  attributeSlotFromPredicate,
+  semanticFactPredicatesForAttributeSlot,
+} from "./attributeSlots.js";
 import { refreshEntityProfileDocs } from "./entityProfile.js";
 import { buildEntityMention, resolveEntityMention } from "./entityResolver.js";
 import { snapshotMemoryLlmBudgetAudit } from "./llmBudgetAudit.js";
@@ -75,6 +79,141 @@ function buildSourceRef(candidate: ClassifiedCandidate): string {
     return candidate.metadata.sourceRef.trim();
   }
   return `${candidate.source.kind}:${candidate.source.messageId ?? candidate.source.runId ?? candidate.candidateId}`;
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)
+    : [];
+}
+
+function sourceRefRole(sourceRef: string | undefined): "user" | "assistant" | "tool" | "unknown" {
+  const normalized = sourceRef?.trim().toLowerCase() ?? "";
+  if (normalized.startsWith("user:")) {
+    return "user";
+  }
+  if (normalized.startsWith("assistant:")) {
+    return "assistant";
+  }
+  if (normalized.startsWith("tool:")) {
+    return "tool";
+  }
+  return "unknown";
+}
+
+function factSourceRefs(fact: NormalizedFact): string[] {
+  const metadata = objectRecord(fact.objectValueJson);
+  const semanticAssertion = objectRecord(metadata?.semanticAssertion);
+  return [
+    ...new Set(
+      [
+        fact.sourceRef,
+        typeof metadata?.sourceRef === "string" ? metadata.sourceRef : undefined,
+        typeof semanticAssertion?.sourceRef === "string" ? semanticAssertion.sourceRef : undefined,
+        ...stringArray(metadata?.sourceRefs),
+        ...stringArray(metadata?.supportRefs),
+        ...stringArray(metadata?.supportContentRefs),
+      ].filter((entry): entry is string => Boolean(entry?.trim())),
+    ),
+  ];
+}
+
+function factHasNonAssistantGrounding(fact: NormalizedFact): boolean {
+  return factSourceRefs(fact).some((sourceRef) => {
+    const role = sourceRefRole(sourceRef);
+    return role === "user" || role === "tool";
+  });
+}
+
+function sourceRefsHaveNonAssistantGrounding(sourceRefs: string[]): boolean {
+  return sourceRefs.some((sourceRef) => {
+    const role = sourceRefRole(sourceRef);
+    return role === "user" || role === "tool";
+  });
+}
+
+function factIsAssistantOnly(fact: NormalizedFact): boolean {
+  const refs = factSourceRefs(fact);
+  return refs.some((sourceRef) => sourceRefRole(sourceRef) === "assistant") && !factHasNonAssistantGrounding(fact);
+}
+
+function assistantFactConflictsWithGroundedFact(
+  store: MemxStoreBundle,
+  fact: NormalizedFact,
+): boolean {
+  if (sourceRefRole(fact.sourceRef) !== "assistant") {
+    return false;
+  }
+  const existing = store.factRepo.findActiveBySemanticKey({
+    agentId: fact.agentId,
+    scope: fact.scope,
+    canonicalSubject: fact.canonicalSubject,
+    predicate: fact.predicate,
+  });
+  return existing.some(
+    (prior) =>
+      factHasNonAssistantGrounding(prior) &&
+      (prior.canonicalObject ?? JSON.stringify(prior.objectValueJson ?? null)) !==
+      (fact.canonicalObject ?? JSON.stringify(fact.objectValueJson ?? null)),
+  );
+}
+
+function shouldSkipFactForAuthority(store: MemxStoreBundle, fact: NormalizedFact): boolean {
+  return factIsAssistantOnly(fact) || assistantFactConflictsWithGroundedFact(store, fact);
+}
+
+function edgeSourceRefs(edge: NormalizedGraphEdge): string[] {
+  return [
+    ...new Set(
+      [
+        edge.evidenceRef,
+        ...stringArray(edge.metadataJson?.sourceRefs),
+        ...stringArray(edge.metadataJson?.supportRefs),
+      ].filter((entry): entry is string => Boolean(entry?.trim())),
+    ),
+  ];
+}
+
+function edgeIsAssistantOnly(edge: NormalizedGraphEdge): boolean {
+  const refs = edgeSourceRefs(edge);
+  return (
+    refs.some((sourceRef) => sourceRefRole(sourceRef) === "assistant") &&
+    !sourceRefsHaveNonAssistantGrounding(refs)
+  );
+}
+
+function semanticCompilerProvenance(candidate: Pick<ClassifiedCandidate, "metadata" | "structuredHints">):
+  | Record<string, unknown>
+  | undefined {
+  const draftProvenance = objectRecord(candidate.structuredHints?.semanticDraft?.compilerProvenance);
+  if (draftProvenance) {
+    return draftProvenance;
+  }
+  const metadataProvenance = objectRecord(candidate.metadata?.turnSemanticCompiler);
+  if (metadataProvenance) {
+    return metadataProvenance;
+  }
+  const frame = objectRecord(candidate.metadata?.turnSemanticFrame);
+  return objectRecord(frame?.compilerProvenance);
+}
+
+export function policyAuditSourceMetadata(
+  candidate: Pick<ClassifiedCandidate, "metadata" | "structuredHints">,
+): Record<string, unknown> {
+  const semanticDraft = candidate.structuredHints?.semanticDraft;
+  if (!semanticDraft) {
+    return {
+      decisionSource: "structured_adapter",
+      materializationSource: "structured_adapter",
+    };
+  }
+  const compiler = semanticCompilerProvenance(candidate);
+  return {
+    decisionSource: "llm_semantic_adapter",
+    semanticSource: typeof compiler?.source === "string" ? compiler.source : "llm",
+    semanticMode: typeof compiler?.mode === "string" ? compiler.mode : "llm",
+    materializationSource: "structured_adapter",
+  };
 }
 
 function candidateTurnIndex(candidate: ClassifiedCandidate): number | undefined {
@@ -466,7 +605,10 @@ function reconcileProjectReferences(
   }
 
   for (const fact of normalized.facts) {
-    const canonical = rewriteProjectName(fact.canonicalSubject, false);
+    const canonical = rewriteProjectName(
+      fact.canonicalSubject,
+      Boolean(attributeSlotFromPredicate(fact.predicate)),
+    );
     fact.canonicalSubject = normalizeName(canonical);
   }
 
@@ -1049,7 +1191,30 @@ export function writeCandidate(
       }
     }
 
+    const skippedFactIds = new Set<string>();
+    const persistedFacts: NormalizedFact[] = [];
     for (const fact of normalized.facts) {
+      if (shouldSkipFactForAuthority(store, fact)) {
+        skippedFactIds.add(fact.factId);
+        continue;
+      }
+      const attributeSlot = attributeSlotFromPredicate(fact.predicate);
+      if (attributeSlot && fact.canonicalObject) {
+        for (const siblingPredicate of semanticFactPredicatesForAttributeSlot(attributeSlot)) {
+          if (siblingPredicate === fact.predicate) {
+            continue;
+          }
+          store.factRepo.supersedeActiveBySubjectAndPredicate({
+            agentId: fact.agentId,
+            scope: fact.scope,
+            canonicalSubject: fact.canonicalSubject,
+            predicate: siblingPredicate,
+            updatedAt: fact.updatedAt,
+            sourceRef: fact.sourceRef,
+            changeReason: "attribute-slot-sibling-replaced",
+          });
+        }
+      }
       const { action } = store.factRepo.upsert(fact, "normalized-update");
       // When a fact supersedes an older version, sync the belief state
       if (action === "versioned") {
@@ -1059,6 +1224,7 @@ export function writeCandidate(
           updatedAt: fact.updatedAt,
         });
       }
+      persistedFacts.push(fact);
       summary.facts += 1;
     }
 
@@ -1068,11 +1234,18 @@ export function writeCandidate(
       summary.entities += 1;
     }
 
+    const skippedEdgeIds = new Set<string>();
+    const persistedEdges: NormalizedGraphEdge[] = [];
     for (const edge of normalized.edges) {
+      if (edgeIsAssistantOnly(edge)) {
+        skippedEdgeIds.add(edge.edgeId);
+        continue;
+      }
       store.graphRepo.upsertEdge(edge);
       persistIdentityLinkForGraphEdge(store, ctx, edge);
       touchedEntityIds.add(edge.srcEntityId);
       touchedEntityIds.add(edge.dstEntityId);
+      persistedEdges.push(edge);
       summary.edges += 1;
     }
 
@@ -1093,7 +1266,19 @@ export function writeCandidate(
     }
 
     const filteredDocs = normalized.vectorDocs.filter((doc) => {
+      if (
+        doc.docKind === "fact" &&
+        (skippedFactIds.has(doc.sourceId) || skippedFactIds.has(doc.docId.replace(/^fact:/u, "")))
+      ) {
+        return false;
+      }
       if (doc.docKind !== "event") {
+        if (
+          doc.docKind === "edge" &&
+          (skippedEdgeIds.has(doc.sourceId) || skippedEdgeIds.has(doc.docId.replace(/^edge:/u, "")))
+        ) {
+          return false;
+        }
         return true;
       }
       return [...insertedEventIds].some((eventId) => `event:${eventId}` === doc.docId);
@@ -1103,9 +1288,9 @@ export function writeCandidate(
     summary.vectorDocs += filteredDocs.length;
     emitWriteMaterializationSignals(store, ctx, {
       states: normalized.states,
-      facts: normalized.facts,
+      facts: persistedFacts,
       events: insertedEvents,
-      graphEdges: normalized.edges,
+      graphEdges: persistedEdges,
       materializedEpoch,
     });
   });
@@ -1113,12 +1298,13 @@ export function writeCandidate(
   if (ctx.config.advanced.enableTelemetryAudit) {
     store.auditRepo.recordPolicyDecision({
       agentId: ctx.agentId,
+      sessionKey: ctx.sessionKey,
       sourceRef: `${candidate.source.kind}:${candidate.candidateId}`,
       candidateText: candidate.rawText,
       decision: candidate.policy,
       createdAt: candidate.observedAt,
       metadataJson: {
-        decisionSource: "deterministic",
+        ...policyAuditSourceMetadata(candidate),
         materializedBy: "normalize/write",
         materializationOutcome: summary,
         classification: candidate.classification,

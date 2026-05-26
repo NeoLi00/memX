@@ -105,6 +105,81 @@ test("native recall context can focus injected evidence on LLM query entities", 
   );
 });
 
+test("native recall focus accepts compound entity aliases when strong evidence mentions one alias", async () => {
+  const { assessNativeContextEligibility, focusRecallBundleForQueryEntities } = await import(
+    "../dist/.runtime/src/host/service.mjs"
+  );
+  const query = "FrostBridge/霜桥同步 的 default queue、API timeout 和导出格式分别是什么？";
+  const bundle = {
+    routeType: "factual",
+    routeConfidence: 0.91,
+    queryText: query,
+    queryAnchors: ["FrostBridge/霜桥同步"],
+    states: [],
+    tasks: [],
+    facts: [
+      row("fact-frost-queue", "frostbridge has default message queue kafka"),
+      row("fact-frost-timeout", "frostbridge has api timeout 12 seconds"),
+      row("fact-frost-format", "frostbridge has export format csv"),
+    ],
+    events: [],
+    graph: { nodes: [], edges: [], paths: [], pathCandidates: [] },
+    alternates: [],
+    diagnostics: [],
+    behavioralGuidance: [],
+    recalledChunkIds: [],
+    recalledChunkTexts: [],
+    promptEvidence: [],
+    evidencePackets: [
+      {
+        ...packet(
+          "packet-frost",
+          [
+            "[answer] frostbridge has default message queue kafka",
+            "[answer] frostbridge has api timeout 12 seconds",
+            "[answer] frostbridge has export format csv",
+          ].join("\n"),
+        ),
+        displayLines: [
+          "[answer] frostbridge has default message queue kafka",
+          "[answer] frostbridge has api timeout 12 seconds",
+          "[answer] frostbridge has export format csv",
+        ],
+        sourceRefs: ["fact:frostbridge"],
+        layers: ["fact"],
+      },
+    ],
+    renderedBlock: "",
+  };
+
+  const focused = focusRecallBundleForQueryEntities(
+    {
+      queryEntities: [{ name: "FrostBridge/霜桥同步", type: "project", role: "subject" }],
+      suppressedEntities: [],
+    },
+    bundle,
+  );
+
+  assert.deepEqual(
+    focused.facts.map((entry) => entry.id),
+    ["fact-frost-queue", "fact-frost-timeout", "fact-frost-format"],
+  );
+  assert.deepEqual(
+    focused.evidencePackets.map((entry) => entry.packetId),
+    ["packet-frost"],
+  );
+  const eligibility = assessNativeContextEligibility(
+    query,
+    {
+      queryEntities: [{ name: "FrostBridge/霜桥同步", type: "project", role: "subject" }],
+      suppressedEntities: [],
+    },
+    focused,
+  );
+  assert.equal(eligibility.eligible, true);
+  assert.equal(eligibility.reason, "llm-query-entities");
+});
+
 test("native recall context withholds weak source-grounded assembled evidence", async () => {
   const { assessNativeContextEligibility } = await import("../dist/.runtime/src/host/service.mjs");
 
@@ -197,6 +272,269 @@ test("native recall context trusts strong source-grounded assembled evidence", a
 
   assert.equal(result.eligible, true);
   assert.equal(result.reason, "llm-query-entities");
+});
+
+test("native recall fallback withholds strong evidence that has no query anchor support", async () => {
+  const { assessNativeContextEligibility } = await import("../dist/.runtime/src/host/service.mjs");
+
+  const result = assessNativeContextEligibility(
+    "请用中文简短回答：今天我们测试一个虚构项目 AsterFlow，先只确认你收到这个名字。",
+    {
+      queryEntities: [],
+      suppressedEntities: [],
+      compilerProvenance: {
+        source: "deterministic",
+        mode: "fallback",
+        reasons: ["query-compile-llm-timeout"],
+      },
+    },
+    {
+      routeType: "mixed",
+      routeConfidence: 0.72,
+      states: [],
+      tasks: [],
+      facts: [],
+      events: [],
+      graph: { nodes: [], edges: [], pathCandidates: [], paths: [] },
+      alternates: [],
+      diagnostics: [],
+      behavioralGuidance: [],
+      recalledChunkIds: [],
+      recalledChunkTexts: [],
+      promptEvidence: [],
+      evidencePackets: [
+        {
+          ...packet("packet-old-project", "银杏仪表盘 has default database sqlite"),
+          coverage: { filled: true, missing: [], confidence: 0.91 },
+          grade: {
+            retrievalScore: 0.91,
+            answerScore: 0.91,
+            contextBindingScore: 0.91,
+            slotCoverageScore: 0.91,
+            authorityScore: 0.91,
+            finalScore: 0.91,
+          },
+          displayLines: ["[answer] 银杏仪表盘 has default database sqlite"],
+          sourceRefs: ["fact:old-project-default-db"],
+        },
+      ],
+      renderedBlock: "[answer] 银杏仪表盘 has default database sqlite",
+    },
+  );
+
+  assert.equal(result.eligible, false);
+  assert.equal(result.reason, "query-anchor-mismatch");
+});
+
+test("native recall fallback withholds same-entity evidence for a different requested attribute", async () => {
+  const { assessNativeContextEligibility } = await import("../dist/.runtime/src/host/service.mjs");
+
+  const result = assessNativeContextEligibility(
+    "不用查看文件。现在蓝杉账本默认队列是什么？只回答队列名。",
+    {
+      queryEntities: [],
+      suppressedEntities: [],
+      compilerProvenance: {
+        source: "deterministic",
+        mode: "fallback",
+        reasons: ["query-compile-llm-timeout"],
+      },
+    },
+    {
+      routeType: "mixed",
+      routeConfidence: 0.72,
+      states: [],
+      tasks: [],
+      facts: [],
+      events: [],
+      graph: { nodes: [], edges: [], pathCandidates: [], paths: [] },
+      alternates: [],
+      diagnostics: [],
+      behavioralGuidance: [],
+      recalledChunkIds: [],
+      recalledChunkTexts: [],
+      promptEvidence: [],
+      evidencePackets: [
+        {
+          ...packet("packet-export-format", "蓝杉账本 has export format parquet"),
+          coverage: { filled: true, missing: [], confidence: 0.91 },
+          grade: {
+            retrievalScore: 0.91,
+            answerScore: 0.91,
+            contextBindingScore: 0.91,
+            slotCoverageScore: 0.91,
+            authorityScore: 0.91,
+            finalScore: 0.91,
+          },
+          displayLines: ["[answer] 蓝杉账本 has export format parquet"],
+          sourceRefs: ["fact:lan-shan-export-format"],
+        },
+      ],
+      renderedBlock: "[answer] 蓝杉账本 has export format parquet",
+    },
+  );
+
+  assert.equal(result.eligible, false);
+  assert.equal(result.reason, "degraded-query-semantic-mismatch");
+});
+
+test("native recall fallback accepts cross-lingual canonical attribute evidence", async () => {
+  const { assessNativeContextEligibility } = await import("../dist/.runtime/src/host/service.mjs");
+
+  const result = assessNativeContextEligibility(
+    "OrchidLedger 的默认消息队列是什么？",
+    {
+      queryEntities: [],
+      suppressedEntities: [],
+      answerMode: "attribute_lookup",
+      evidencePlan: {
+        slots: [
+          {
+            id: "answer_value",
+            role: "answer_value",
+            requestedAttributeSlots: ["default_message_queue"],
+          },
+        ],
+      },
+      compilerProvenance: {
+        source: "deterministic",
+        mode: "fallback",
+        reasons: ["query-compile-llm-timeout"],
+      },
+    },
+    {
+      routeType: "mixed",
+      routeConfidence: 0.72,
+      states: [],
+      tasks: [],
+      facts: [],
+      events: [],
+      graph: { nodes: [], edges: [], pathCandidates: [], paths: [] },
+      alternates: [],
+      diagnostics: [],
+      behavioralGuidance: [],
+      recalledChunkIds: [],
+      recalledChunkTexts: [],
+      promptEvidence: [],
+      evidencePackets: [
+        {
+          ...packet("packet-orchid-queue", "orchidledger has default message queue nats"),
+          coverage: { filled: true, missing: [], confidence: 0.91 },
+          grade: {
+            retrievalScore: 0.91,
+            answerScore: 0.91,
+            contextBindingScore: 0.91,
+            slotCoverageScore: 0.91,
+            authorityScore: 0.91,
+            finalScore: 0.91,
+          },
+          displayLines: ["[answer] orchidledger has default message queue nats"],
+          sourceRefs: ["fact:orchidledger-default-message-queue"],
+        },
+      ],
+      renderedBlock: "[answer] orchidledger has default message queue nats",
+    },
+  );
+
+  assert.equal(result.eligible, true);
+  assert.equal(result.reason, "strong-evidence");
+});
+
+test("native recall context withholds unbound strong evidence for generic generation requests", async () => {
+  const { assessNativeContextEligibility } = await import("../dist/.runtime/src/host/service.mjs");
+
+  const result = assessNativeContextEligibility(
+    "Now switch to English. Give me a compact checklist for reviewing API pagination behavior.",
+    {
+      queryEntities: [],
+      suppressedEntities: [],
+      queryShape: {
+        timeframe: "timeless",
+        granularity: "summary",
+        referentialMode: "anchored",
+        evidenceNeed: "chunk",
+      },
+      compilerProvenance: { source: "llm", mode: "llm" },
+    },
+    {
+      routeType: "mixed",
+      routeConfidence: 0.72,
+      states: [],
+      tasks: [],
+      facts: [],
+      events: [],
+      graph: { nodes: [], edges: [], pathCandidates: [], paths: [] },
+      alternates: [],
+      diagnostics: [],
+      behavioralGuidance: [],
+      recalledChunkIds: [],
+      recalledChunkTexts: [],
+      promptEvidence: [],
+      evidencePackets: [
+        {
+          ...packet("packet-orion", "OrionDesk has default vector db Qdrant", ["OrionDesk"]),
+          displayLines: ["[answer] OrionDesk has default vector db Qdrant"],
+          sourceRefs: ["fact:oriondesk-vector-db"],
+        },
+      ],
+      renderedBlock: "[answer] OrionDesk has default vector db Qdrant",
+    },
+  );
+
+  assert.equal(result.eligible, false);
+  assert.equal(result.reason, "unbound-context");
+});
+
+test("native recall context honors LLM context exclusions for prior projects", async () => {
+  const { assessNativeContextEligibility } = await import("../dist/.runtime/src/host/service.mjs");
+
+  const result = assessNativeContextEligibility(
+    "Now switch to English. Give me a compact checklist for reviewing API pagination behavior; do not mention any previous project.",
+    {
+      queryEntities: [],
+      suppressedEntities: [],
+      contextExclusions: [
+        {
+          kind: "prior_project",
+          label: "previous project",
+          reason: "The user explicitly excluded prior project context.",
+        },
+      ],
+      queryShape: {
+        timeframe: "timeless",
+        granularity: "summary",
+        referentialMode: "anchored",
+        evidenceNeed: "chunk",
+      },
+      compilerProvenance: { source: "llm", mode: "llm" },
+    },
+    {
+      routeType: "mixed",
+      routeConfidence: 0.72,
+      states: [],
+      tasks: [],
+      facts: [],
+      events: [],
+      graph: { nodes: [], edges: [], pathCandidates: [], paths: [] },
+      alternates: [],
+      diagnostics: [],
+      behavioralGuidance: [],
+      recalledChunkIds: [],
+      recalledChunkTexts: [],
+      promptEvidence: [],
+      evidencePackets: [
+        {
+          ...packet("packet-orion", "OrionDesk has default vector db Qdrant", ["OrionDesk"]),
+          displayLines: ["[answer] OrionDesk has default vector db Qdrant"],
+          sourceRefs: ["fact:oriondesk-vector-db"],
+        },
+      ],
+      renderedBlock: "[answer] OrionDesk has default vector db Qdrant",
+    },
+  );
+
+  assert.equal(result.eligible, false);
+  assert.equal(result.reason, "excluded-context");
 });
 
 test("native recall context withholds direct rows when packet assembly has no injectable evidence", async () => {

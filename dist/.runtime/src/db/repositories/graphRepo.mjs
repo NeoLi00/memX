@@ -1,8 +1,8 @@
 import { normalizeName, randomId, safeJsonParse, stableHash } from "../../support.mjs";
-import { ENTITY_TYPES } from "../../types.mjs";
-import { normalizeGraphRelationType } from "../../pipeline/semantic/heuristics.mjs";
 import { projectAliasVariants, projectIdentityKey } from "../../pipeline/projectIdentity.mjs";
+import { normalizeGraphRelationType } from "../../pipeline/semantic/heuristics.mjs";
 import { buildGraphPathCandidates } from "../../pipeline/graphPathEngine.mjs";
+import { ENTITY_TYPES } from "../../types.mjs";
 //#region src/db/repositories/graphRepo.ts
 function entityTypeValue(value) {
 	return ENTITY_TYPES.includes(value) ? value : "unknown";

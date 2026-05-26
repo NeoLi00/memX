@@ -1,16 +1,16 @@
 import { clamp01, normalizeText, objectRecord, stableHash, truncateText } from "../support.mjs";
 import { canonicalStateKey } from "./semantic/heuristics.mjs";
-import { TASK_METADATA_WORKFLOW_SNAPSHOT_DESCRIPTORS, isSnapshotFactualStateKey, sanitizeTaskMetadata } from "./authority.mjs";
-import { filterBootstrapRows, isBootstrapMemoryContamination } from "./bootstrapFilter.mjs";
 import { buildEntityMention, resolveEntityMention } from "./entityResolver.mjs";
+import { buildGraphPathCandidates } from "./graphPathEngine.mjs";
 import { containsLikelySecret, looksLikePromptInjection } from "../security/injection.mjs";
+import { filterBootstrapRows, isBootstrapMemoryContamination } from "./bootstrapFilter.mjs";
 import "./semantics.mjs";
 import { dedupeEvidenceRows, describeStateValue, formatFactLine, lineageFromMetadata, normalizeSearchText, rowsFromSearchHits, shouldSuppressRecallText, splitLabelValue, toEvidenceRow } from "./memoryObjectsHelpers.mjs";
+import { TASK_METADATA_WORKFLOW_SNAPSHOT_DESCRIPTORS, isSnapshotFactualStateKey, sanitizeTaskMetadata } from "./authority.mjs";
 import { evaluateStateCurrentness } from "./stateLifecycle.mjs";
 import { STRATEGY_MAX_CONTRADICTION } from "./constants.mjs";
-import { buildGraphPathCandidates } from "./graphPathEngine.mjs";
-import { buildWorkingProjectionBlocks, createMemorySelectionObjective } from "./memoryObjectsProjection.mjs";
 import { semanticTaskSummaryText } from "./taskSummary.mjs";
+import { buildWorkingProjectionBlocks, createMemorySelectionObjective } from "./memoryObjectsProjection.mjs";
 //#region src/pipeline/memoryObjects.ts
 const RELATIONAL_FACT_PREDICATES = new Set([
 	"depends_on",

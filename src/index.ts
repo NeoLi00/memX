@@ -1,10 +1,4 @@
 import type { OpenClawPluginApi, OpenClawPluginDefinition } from "openclaw/plugin-sdk/core";
-export * from "./host/connect.js";
-export * from "./host/hookPayload.js";
-export * from "./host/mcpProtocol.js";
-export * from "./host/quickstart.js";
-export * from "./host/standaloneQuickstart.js";
-export * from "./host/service.js";
 import { registerMemxCli } from "./cli/registerCli.js";
 import { memxConfigSchema, DEFAULT_MEMORY_CONFIG } from "./config.js";
 import { MEMX_BRAND_NAME, MEMX_PLUGIN_ID } from "./identity.js";
@@ -28,7 +22,7 @@ import { captureAgentEndTurn } from "./pipeline/turnCapture.js";
 import { createMemxTools } from "./plugin-tools.js";
 import { buildOperationContext, type MemxStoreBundle, MemxRuntimeManager } from "./runtime.js";
 import { formatMemxContextBlock, stripInjectedHistoricalBlock } from "./security/escaping.js";
-import { resolveDefaultScope } from "./security/scopes.js";
+import { resolveDefaultScope, scopeVarsForContext } from "./security/scopes.js";
 import { nowIso, randomId, truncateText } from "./support.js";
 import type {
   BackgroundRecallBundle,
@@ -788,12 +782,7 @@ export function createMemoryMemxPlugin(): OpenClawPluginDefinition {
 
           if (config.advanced.enableTurnScheduler) {
             const recall = manager.consumeRecall(ctx.agentId, ctx.sessionKey);
-            const captureScope = resolveDefaultScope(config, {
-              agentId: ctx.agentId,
-              sessionKey,
-              project: opCtx.project,
-              workspace: opCtx.workspaceDir,
-            });
+            const captureScope = resolveDefaultScope(config, scopeVarsForContext(opCtx));
             captured = captureAgentEndTurn({
               agentId: ctx.agentId,
               scope: captureScope,

@@ -1,5 +1,5 @@
 import type { MemxStoreBundle } from "../runtime.js";
-import { normalizeText, randomId, truncateText } from "../support.js";
+import { normalizeText, nowIso, randomId, stableHash, truncateText } from "../support.js";
 import type {
   ClassifiedCandidate,
   ConversationChunk,
@@ -44,6 +44,13 @@ const MAINTENANCE_REFERENCE_CONTEXT_MAX_TURNS = 4;
 const MAINTENANCE_REFERENCE_CONTEXT_MAX_MESSAGES_PER_TURN = 4;
 const MAINTENANCE_REFERENCE_SUMMARY_CHARS = 160;
 const MAINTENANCE_REFERENCE_TEXT_CHARS = 360;
+const SEMANTIC_WRITE_RETRY_MAX_ATTEMPTS = 6;
+const SEMANTIC_WRITE_RETRY_BACKOFF_MS = [
+  5 * 60_000,
+  15 * 60_000,
+  60 * 60_000,
+  6 * 60 * 60_000,
+];
 
 function fallbackTurnFrame(
   sourceRefs: string[],
@@ -159,6 +166,30 @@ function segmentsBySourceRef(segments: SourceSegmentRecord[]): Map<string, Sourc
   return grouped;
 }
 
+function segmentsByTurnId(segments: SourceSegmentRecord[]): Map<string, SourceSegmentRecord[]> {
+  const grouped = new Map<string, SourceSegmentRecord[]>();
+  for (const segment of segments) {
+    const current = grouped.get(segment.turnId) ?? [];
+    current.push(segment);
+    grouped.set(segment.turnId, current);
+  }
+  return grouped;
+}
+
+function semanticRepairInputHash(turnId: string, segments: SourceSegmentRecord[]): string {
+  return stableHash([
+    turnId,
+    ...segments.map((segment) =>
+      [
+        segment.parentSourceRef,
+        String(segment.segmentIndex),
+        segment.contentHash,
+        normalizeText(segment.text),
+      ].join("\u0001"),
+    ),
+  ]);
+}
+
 function uniqueTexts(texts: string[]): string[] {
   const seen = new Set<string>();
   const result: string[] = [];
@@ -171,6 +202,33 @@ function uniqueTexts(texts: string[]): string[] {
     result.push(text);
   }
   return result;
+}
+
+function addMsToIso(baseIso: string, deltaMs: number): string {
+  const baseMs = Date.parse(baseIso);
+  const safeBaseMs = Number.isFinite(baseMs) ? baseMs : Date.now();
+  return new Date(safeBaseMs + deltaMs).toISOString();
+}
+
+function semanticWriteFailureDisposition(attemptCount: number, failedAt: string): {
+  status: "retrying" | "failed";
+  nextAttemptAt?: string;
+  maxAttempts: number;
+} {
+  if (attemptCount >= SEMANTIC_WRITE_RETRY_MAX_ATTEMPTS) {
+    return {
+      status: "failed",
+      maxAttempts: SEMANTIC_WRITE_RETRY_MAX_ATTEMPTS,
+    };
+  }
+  const delayIndex = Math.max(0, Math.min(attemptCount - 2, SEMANTIC_WRITE_RETRY_BACKOFF_MS.length - 1));
+  const delayMs =
+    SEMANTIC_WRITE_RETRY_BACKOFF_MS[delayIndex] ?? SEMANTIC_WRITE_RETRY_BACKOFF_MS.at(-1)!;
+  return {
+    status: "retrying",
+    nextAttemptAt: addMsToIso(failedAt, delayMs),
+    maxAttempts: SEMANTIC_WRITE_RETRY_MAX_ATTEMPTS,
+  };
 }
 
 function candidateTextFromHints(hints: MemoryCandidateStructuredHints): string {
@@ -287,10 +345,6 @@ export async function runSourceSegmentSemanticExtraction(
   if (params.turnIds.length === 0) {
     return stats;
   }
-  if (!store.reasoner.isEnabled?.() || !store.reasoner.compileLongTurnSemantics) {
-    stats.skippedReasons.push("llm-unavailable");
-    return stats;
-  }
   const segments = store.sourceSegmentRepo.listByTurnIds({
     agentId: ctx.agentId,
     scopes: ctx.scopes,
@@ -299,7 +353,56 @@ export async function runSourceSegmentSemanticExtraction(
     limit: 256,
   });
   const grouped = segmentsBySourceRef(segments);
+  const turnSegments = segmentsByTurnId(segments);
   stats.sourceGroupsConsidered = grouped.size;
+  const repairStartedAt = ctx.now || nowIso();
+  const attemptsByTurn = new Map<string, { attemptCount: number }>();
+  for (const [turnId, entries] of turnSegments) {
+    const attempt = store.auditRepo.recordSemanticWriteAttemptStart({
+      agentId: ctx.agentId,
+      sessionKey: params.sessionKey,
+      scope: entries[0]?.scope ?? ctx.scopes[0] ?? `agent:${ctx.agentId}`,
+      turnId,
+      sourceRefs: sourceRefsForSegments(entries),
+      inputHash: semanticRepairInputHash(turnId, entries),
+      startedAt: repairStartedAt,
+      retryOnly: true,
+    });
+    if (attempt.claimed) {
+      attemptsByTurn.set(turnId, { attemptCount: attempt.attemptCount });
+    }
+  }
+  const compileLongTurnSemantics = store.reasoner.compileLongTurnSemantics?.bind(store.reasoner);
+  if (!store.reasoner.isEnabled?.() || !compileLongTurnSemantics) {
+    stats.skippedReasons.push("llm-unavailable");
+    for (const turnId of attemptsByTurn.keys()) {
+      const completedAt = ctx.now || nowIso();
+      const attemptCount = attemptsByTurn.get(turnId)?.attemptCount ?? 1;
+      const disposition = semanticWriteFailureDisposition(attemptCount, completedAt);
+      store.auditRepo.finishSemanticWriteAttempt({
+        agentId: ctx.agentId,
+        sessionKey: params.sessionKey,
+        turnId,
+        status: disposition.status,
+        error:
+          disposition.status === "failed"
+            ? `maintenance semantic scanner unavailable: llm-unavailable after ${attemptCount} attempts`
+            : "maintenance semantic scanner unavailable: llm-unavailable",
+        resultJson: {
+          stage: "maintenance_async",
+          skippedReasons: stats.skippedReasons,
+          retry: {
+            attemptCount,
+            maxAttempts: disposition.maxAttempts,
+            nextAttemptAt: disposition.nextAttemptAt,
+          },
+        },
+        nextAttemptAt: disposition.nextAttemptAt,
+        completedAt,
+      });
+    }
+    return stats;
+  }
   const referenceContext = buildMaintenanceReferenceContext(store, ctx, params.sessionKey);
   const scanInput = buildLongTurnSemanticScanInputFromSegments(segments, referenceContext);
   stats.sourceGroupsScanned = scanInput.messages.length;
@@ -308,12 +411,38 @@ export async function runSourceSegmentSemanticExtraction(
   }
 
   const fallback = fallbackTurnFrame(sourceRefsForSegments(segments), referenceContext);
-  const patch = await store.reasoner.compileLongTurnSemantics(scanInput, fallback, {
+  const patch = await compileLongTurnSemantics(scanInput, fallback, {
     stage: "maintenance_async",
     audit: ctx.llmBudgetAudit,
   });
   if (!patch) {
     stats.skippedReasons.push("llm-empty");
+    for (const turnId of attemptsByTurn.keys()) {
+      const completedAt = ctx.now || nowIso();
+      const attemptCount = attemptsByTurn.get(turnId)?.attemptCount ?? 1;
+      const disposition = semanticWriteFailureDisposition(attemptCount, completedAt);
+      store.auditRepo.finishSemanticWriteAttempt({
+        agentId: ctx.agentId,
+        sessionKey: params.sessionKey,
+        turnId,
+        status: disposition.status,
+        error:
+          disposition.status === "failed"
+            ? `maintenance semantic scanner returned no recognized LLM semantic frame after ${attemptCount} attempts`
+            : "maintenance semantic scanner returned no recognized LLM semantic frame",
+        resultJson: {
+          stage: "maintenance_async",
+          skippedReasons: stats.skippedReasons,
+          retry: {
+            attemptCount,
+            maxAttempts: disposition.maxAttempts,
+            nextAttemptAt: disposition.nextAttemptAt,
+          },
+        },
+        nextAttemptAt: disposition.nextAttemptAt,
+        completedAt,
+      });
+    }
     return stats;
   }
   const frame = mergeMaintenanceFrame(fallback, patch);
@@ -353,6 +482,22 @@ export async function runSourceSegmentSemanticExtraction(
     classified.confidence = computeConfidence(classified);
     writeCandidate(store, ctx, classified);
     stats.candidatesWritten += 1;
+  }
+  for (const turnId of attemptsByTurn.keys()) {
+    store.auditRepo.finishSemanticWriteAttempt({
+      agentId: ctx.agentId,
+      sessionKey: params.sessionKey,
+      turnId,
+      status: "succeeded",
+      resultJson: {
+        stage: "maintenance_async",
+        compilerProvenance: frame.compilerProvenance,
+        sourceGroupsScanned: stats.sourceGroupsScanned,
+        candidatesWritten: stats.candidatesWritten,
+        skippedReasons: stats.skippedReasons,
+      },
+      completedAt: nowIso(),
+    });
   }
   return stats;
 }

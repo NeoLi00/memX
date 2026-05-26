@@ -92,17 +92,22 @@ README 命令默认使用 GitHub package spec。每次全新执行都会拉取 G
 只有想覆盖默认值时才需要额外传 `--embedding-provider` 和 `--embedding-model`。使用 `--dry-run`
 可以先预览会写入哪些文件、会执行哪些 exec-form 命令。
 
-对 Codex 和 Claude Code，native hooks 是默认生命周期入口，自动负责召回和 turn 捕获。它们的
-MCP server 默认使用 `--mcp-tools none`，不向 agent 暴露任何 memX 工具；这样既避免重复召回/
-重复写入，也避免 agent 把 audit 数据当作旁路记忆读取。只有明确希望 agent 看见完整 MCP 工具集时，
-才加 `--mcp-tools full`。通用 MCP quickstart 默认仍是 `full`，因为它没有 native lifecycle
-hooks。默认 native 记忆也会按 host 隔离，所以 Codex 和 Claude Code 不会共用同一个本地数据库，
-除非你主动覆盖 database path 和 actor 设置。
+对 Codex 和 Claude Code，native hooks 是默认生命周期入口，自动负责召回和 turn 捕获。Quickstart
+会一次性安装 native plugin、写入共享 memX 配置、启动或刷新 managed local memX service，并默认用
+`--mcp-tools none` 隐藏 MCP 记忆工具。这样既避免重复召回/重复写入，也避免 agent 把 audit 数据当作
+旁路记忆读取。只有明确希望 agent 看见完整 MCP 工具集时，才加 `--mcp-tools full`。通用 MCP
+quickstart 默认仍是 `full`，因为它没有 native lifecycle hooks。默认 native 记忆也会按 host
+隔离，所以 Codex 和 Claude Code 不会共用同一个本地数据库，除非你主动覆盖 database path 和
+actor 设置。
+
+如果 `http://127.0.0.1:3878` 已经被一个不受当前 quickstart 管理的 memX-compatible service 占用，
+quickstart 会停止并提示冲突，而不是静默复用旧服务。你可以先停掉旧服务，或传一个空闲本地地址，
+例如 `--memx-url http://127.0.0.1:3888`。
 
 ### Claude Code
 
 这条命令会一次性写入共享 memX 配置、生成本地 Claude Code plugin marketplace、安装 native
-生命周期 hooks，并接上 plugin 自带的 MCP server。
+生命周期 hooks，并启动 managed local memX service。
 
 ```bash
 npx -y -p github:NeoLi00/memX memx quickstart claude-code \
@@ -114,7 +119,8 @@ npx -y -p github:NeoLi00/memX memx quickstart claude-code \
 
 ### Codex
 
-这条命令会一次性写入共享 memX 配置、配置 Codex MCP，并安装 native 生命周期 hooks。
+这条命令会一次性写入共享 memX 配置、生成本地 Codex plugin marketplace、安装 native 生命周期
+hooks，并启动 managed local memX service。
 
 ```bash
 npx -y -p github:NeoLi00/memX memx quickstart codex \
@@ -136,6 +142,9 @@ npx -y -p github:NeoLi00/memX memx quickstart openclaw \
 
 ### 通用 MCP
 
+这个路径用于没有 memX native lifecycle adapter 的 MCP client。Quickstart 会写入共享 memX
+配置、启动 managed local memX service，并输出可以放进 MCP client 的 server 配置。
+
 ```bash
 npx -y -p github:NeoLi00/memX memx quickstart mcp \
   --llm-provider openai-compatible \
@@ -144,16 +153,22 @@ npx -y -p github:NeoLi00/memX memx quickstart mcp \
   --llm-api-key sk-your-provider-key
 ```
 
-Claude Code、Codex 和通用 MCP client 配置完成后，需要启动共享本地服务：
+### Service 管理
 
 ```bash
-npx -y -p github:NeoLi00/memX memx-server
+npx -y -p github:NeoLi00/memX memx service status
+npx -y -p github:NeoLi00/memX memx service restart
+npx -y -p github:NeoLi00/memX memx service stop
 ```
+
+如果 quickstart 时用了非默认路径或端口，管理 service 时也传同样的 `--home`、`--memx-url` 和
+`--memx-secret`。
 
 ## 干净卸载
 
 每个卸载命令都会先备份目标配置文件，然后只删除 memX 自己写入的条目。Claude Code 和 Codex
-清理会同时卸载 native plugin、移除本地 marketplace，并删除生成的 marketplace snapshot。
+清理会同时停止 managed local service、卸载 native plugin、移除本地 marketplace，并删除生成的
+marketplace snapshot。
 OpenClaw 清理会额外删掉残留的 `memx` / `memory-memx` slot、allow 和 entry 引用，并在
 OpenClaw 仍能识别插件时 best-effort 删除当前和旧版插件文件。
 

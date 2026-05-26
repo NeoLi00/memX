@@ -1,8 +1,8 @@
 import { expandCjkFamilySubwords, wordLikeSegments } from "./multilingualLexicon.mjs";
+import fs from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import fs from "node:fs/promises";
 //#region src/support.ts
 function nowIso(date = /* @__PURE__ */ new Date()) {
 	return date.toISOString();

@@ -1,4 +1,27 @@
 import type { MemoryPluginConfig, ScopeVars } from "../types.js";
+import { resolveUserPath, stableHash } from "../support.js";
+
+export function workspaceScopeValue(workspaceDir: string | undefined): string {
+  const trimmed = workspaceDir?.trim();
+  if (!trimmed) {
+    return "default";
+  }
+  return stableHash([resolveUserPath(trimmed)]).slice(0, 16);
+}
+
+export function scopeVarsForContext(input: {
+  agentId?: string;
+  sessionKey?: string;
+  project?: string;
+  workspaceDir?: string;
+}): ScopeVars {
+  return {
+    agentId: input.agentId,
+    sessionKey: input.sessionKey,
+    project: input.project,
+    workspace: workspaceScopeValue(input.workspaceDir),
+  };
+}
 
 export function renderTemplate(input: string, vars: ScopeVars): string {
   return input
@@ -39,23 +62,24 @@ export function isScopeAllowed(
 export function defaultRetrievalScopes(config: MemoryPluginConfig, vars: ScopeVars): string[] {
   const allowed = resolveAllowedScopes(config, vars);
   const scopes = new Set<string>();
-  for (const entry of allowed) {
-    if (entry === "global") {
-      scopes.add(entry);
-    }
-    if (vars.agentId && entry === `agent:${vars.agentId}`) {
-      scopes.add(entry);
-    }
-    if (vars.sessionKey && entry === `session:${vars.sessionKey}`) {
-      scopes.add(entry);
-    }
-    if (vars.project && entry === `project:${vars.project}`) {
-      scopes.add(entry);
-    }
-  }
   const fallbackScope = resolveDefaultScope(config, vars);
-  if (fallbackScope) {
+  if (fallbackScope && allowed.includes(fallbackScope)) {
     scopes.add(fallbackScope);
+  }
+  const workspaceScope = vars.workspace ? `workspace:${vars.workspace}` : "";
+  if (workspaceScope && allowed.includes(workspaceScope)) {
+    scopes.add(workspaceScope);
+  }
+  const sessionScope = vars.sessionKey ? `session:${vars.sessionKey}` : "";
+  if (sessionScope && allowed.includes(sessionScope)) {
+    scopes.add(sessionScope);
+  }
+  const projectScope = vars.project ? `project:${vars.project}` : "";
+  if (projectScope && allowed.includes(projectScope)) {
+    scopes.add(projectScope);
+  }
+  if (fallbackScope === "global" && allowed.includes("global")) {
+    scopes.add("global");
   }
   return [...scopes];
 }

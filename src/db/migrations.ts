@@ -833,4 +833,51 @@ export const MEMX_MIGRATIONS: DbMigration[] = [
         ON source_segments(agent_id, scope, content_hash);
     `,
   },
+  {
+    version: 20,
+    description: "session-scoped audit rows",
+    sql: `
+      ALTER TABLE retrieval_audit
+        ADD COLUMN session_key TEXT;
+      ALTER TABLE policy_decisions
+        ADD COLUMN session_key TEXT;
+      ALTER TABLE maintenance_runs
+        ADD COLUMN session_key TEXT;
+
+      CREATE INDEX IF NOT EXISTS idx_retrieval_audit_agent_session
+        ON retrieval_audit(agent_id, session_key, created_at);
+      CREATE INDEX IF NOT EXISTS idx_policy_agent_session
+        ON policy_decisions(agent_id, session_key, created_at);
+      CREATE INDEX IF NOT EXISTS idx_maintenance_agent_session
+        ON maintenance_runs(agent_id, session_key, started_at);
+    `,
+  },
+  {
+    version: 21,
+    description: "durable semantic write job ledger",
+    sql: `
+      CREATE TABLE IF NOT EXISTS semantic_write_jobs (
+        job_id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        session_key TEXT NOT NULL,
+        scope TEXT NOT NULL,
+        turn_id TEXT NOT NULL,
+        job_type TEXT NOT NULL CHECK (job_type IN ('turn_semantic_extraction')),
+        source_refs_json TEXT NOT NULL DEFAULT '[]',
+        input_hash TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'succeeded', 'retrying', 'failed')),
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        result_json TEXT NOT NULL DEFAULT '{}',
+        next_attempt_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_semantic_write_jobs_turn
+        ON semantic_write_jobs(agent_id, session_key, turn_id, job_type);
+      CREATE INDEX IF NOT EXISTS idx_semantic_write_jobs_status
+        ON semantic_write_jobs(agent_id, session_key, status, updated_at);
+    `,
+  },
 ];

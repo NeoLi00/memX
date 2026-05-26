@@ -1,5 +1,6 @@
 import { nowIso, randomId, resolveUserPath } from "./support.mjs";
 import { createMemoryLlmBudgetAudit } from "./pipeline/llmBudgetAudit.mjs";
+import { MemxReasoner } from "./pipeline/reasoner.mjs";
 import { MemxDbClient } from "./db/client.mjs";
 import { AbstractionRepo } from "./db/repositories/abstractionRepo.mjs";
 import { AuditRepo } from "./db/repositories/auditRepo.mjs";
@@ -15,10 +16,9 @@ import { StrategyRepo } from "./db/repositories/strategyRepo.mjs";
 import { TaskRepo } from "./db/repositories/taskRepo.mjs";
 import { VectorRepo } from "./db/repositories/vectorRepo.mjs";
 import { runAutomaticMaintenanceBatch } from "./pipeline/maintenanceBatch.mjs";
-import { MemxReasoner } from "./pipeline/reasoner.mjs";
 import { MemxTurnScheduler } from "./pipeline/turnScheduler.mjs";
 import { OptionalEmbeddingBackend } from "./search/backends/embeddingBackend.mjs";
-import { defaultRetrievalScopes, renderTemplate } from "./security/scopes.mjs";
+import { defaultRetrievalScopes, renderTemplate, scopeVarsForContext } from "./security/scopes.mjs";
 //#region src/runtime.ts
 function storeKey(agentId, dbPath) {
 	return `${agentId}:${dbPath}`;
@@ -26,14 +26,17 @@ function storeKey(agentId, dbPath) {
 function maintenanceKey(agentId, dbPath, sessionKey) {
 	return `${agentId}:${dbPath}:${sessionKey}`;
 }
+function uniqueStrings(values) {
+	return [...new Set(values.filter((value) => value.trim().length > 0))];
+}
+function stagedRecallKey(ctx) {
+	const workspace = ctx.workspaceDir?.trim();
+	const scope = workspace ? `workspace:${workspace}` : `session:${ctx.sessionKey ?? "default"}`;
+	return `${ctx.agentId}:${ctx.dbPath}:${scope}`;
+}
 function resolveDbPath(config, actor) {
 	if (!actor.agentId) return null;
-	return resolveUserPath(renderTemplate(config.dbPath, {
-		agentId: actor.agentId,
-		sessionKey: actor.sessionKey,
-		project: actor.project,
-		workspace: actor.workspaceDir
-	}));
+	return resolveUserPath(renderTemplate(config.dbPath, scopeVarsForContext(actor)));
 }
 function buildOperationContext(config, actor, overrides) {
 	if (!actor.agentId) return null;
@@ -48,12 +51,7 @@ function buildOperationContext(config, actor, overrides) {
 		channelId: actor.channelId,
 		config,
 		dbPath,
-		scopes: defaultRetrievalScopes(config, {
-			agentId: actor.agentId,
-			sessionKey: actor.sessionKey,
-			project: actor.project,
-			workspace: actor.workspaceDir
-		}),
+		scopes: defaultRetrievalScopes(config, scopeVarsForContext(actor)),
 		now: overrides?.now ?? nowIso(),
 		llmBudgetAudit: createMemoryLlmBudgetAudit()
 	};
@@ -90,6 +88,7 @@ var MemxRuntimeManager = class {
 	async closeAll() {
 		await this.flushAll();
 		await this.flushPendingMaintenance("shutdown");
+		await this.flushRetryableSemanticWriteJobs("shutdown");
 		for (const timer of this.maintenanceTimers.values()) clearTimeout(timer);
 		this.maintenanceTimers.clear();
 		for (const entry of this.stores.values()) {
@@ -141,10 +140,9 @@ var MemxRuntimeManager = class {
 		return payload;
 	}
 	rememberStagedRecallableTurn(ctx, messages) {
-		const sessionKey = ctx.sessionKey ?? "default";
 		const text = messages.map((message) => `[${message.role}] ${message.content.trim()}`).filter((entry) => entry.trim().length > 0).join("\n");
 		if (!text.trim()) return;
-		const key = `${ctx.agentId}:${sessionKey}`;
+		const key = stagedRecallKey(ctx);
 		const turnId = messages[0]?.turnId ?? randomId("staged-turn");
 		const observedAt = messages.at(-1)?.observedAt ?? nowIso();
 		const existing = (this.stagedRecallableTurns.get(key) ?? []).filter((entry) => entry.turnId !== turnId);
@@ -156,8 +154,7 @@ var MemxRuntimeManager = class {
 		this.stagedRecallableTurns.set(key, existing.slice(-6));
 	}
 	recentStagedRecallableTurns(ctx, limit = 4) {
-		const sessionKey = ctx.sessionKey ?? "default";
-		const key = `${ctx.agentId}:${sessionKey}`;
+		const key = stagedRecallKey(ctx);
 		return [...this.stagedRecallableTurns.get(key) ?? []].sort((left, right) => right.observedAt.localeCompare(left.observedAt)).slice(0, Math.max(1, Math.min(Math.trunc(limit), 8)));
 	}
 	async recordMaintenanceTurn(ctx, params) {
@@ -318,6 +315,72 @@ var MemxRuntimeManager = class {
 			}
 		}
 	}
+	storeContextTemplatesForStore(store) {
+		const templates = [...this.storeContexts.values()].filter((template) => template.dbPath === store.client.dbPath);
+		const seen = /* @__PURE__ */ new Set();
+		const deduped = [];
+		for (const template of templates) {
+			const key = `${template.agentId}:${template.sessionKey ?? "default"}`;
+			if (seen.has(key)) continue;
+			seen.add(key);
+			deduped.push(template);
+		}
+		return deduped;
+	}
+	async flushRetryableSemanticWriteJobs(reason) {
+		const entries = await Promise.all(this.stores.values());
+		for (const store of entries) for (const baseTemplate of this.storeContextTemplatesForStore(store)) {
+			const now = nowIso();
+			const retryJobs = store.auditRepo.listRetryableSemanticWriteJobs({
+				agentId: baseTemplate.agentId,
+				now,
+				limit: 200
+			});
+			const sessionKeys = uniqueStrings(retryJobs.map((job) => job.sessionKey));
+			for (const sessionKey of sessionKeys) {
+				const sessionJobs = retryJobs.filter((job) => job.sessionKey === sessionKey);
+				const template = {
+					...baseTemplate,
+					sessionKey,
+					dbPath: store.client.dbPath,
+					scopes: uniqueStrings([...baseTemplate.scopes, ...sessionJobs.map((job) => job.scope)])
+				};
+				const key = maintenanceKey(template.agentId, template.dbPath, sessionKey);
+				const existing = this.maintenanceLoops.get(key);
+				if (existing) await existing;
+				if (store.auditRepo.listRetryableSemanticWriteJobs({
+					agentId: template.agentId,
+					sessionKey,
+					now: nowIso(),
+					limit: 1
+				}).length === 0) continue;
+				const upperWatermarks = {
+					event: store.eventRepo.latestObservedAt({
+						agentId: template.agentId,
+						scopes: template.scopes,
+						sessionKey
+					}),
+					signal: store.auditRepo.latestSignalCreatedAt({
+						agentId: template.agentId,
+						sessionKey
+					}),
+					task: store.taskRepo.latestUpdatedAt({
+						agentId: template.agentId,
+						scopes: template.scopes,
+						sessionKey
+					})
+				};
+				await runAutomaticMaintenanceBatch(store, this.buildMaintenanceContext(template), {
+					sessionKey,
+					turnIds: [],
+					turnCount: 0,
+					reason,
+					lowerWatermarks: {},
+					upperWatermarks
+				});
+			}
+		}
+	}
 	maintenanceContextForPendingState(store, state) {
 		const sessionKey = state.sessionKey || "default";
 		const exactKey = maintenanceKey(state.agentId, store.client.dbPath, sessionKey);
@@ -337,6 +400,13 @@ var MemxRuntimeManager = class {
 		const vectorRepo = new VectorRepo(client);
 		const retrievalBackend = new OptionalEmbeddingBackend(vectorRepo, ctx.config.embedding, this.logger);
 		retrievalBackend.prewarmLocalEmbeddings();
+		const auditRepo = new AuditRepo(client);
+		auditRepo.markExpiredRunningMaintenanceRunsInterrupted({
+			agentId: ctx.agentId,
+			completedAt: nowIso(),
+			startedBefore: (/* @__PURE__ */ new Date(Date.now() - 5 * 6e4)).toISOString(),
+			reason: "runtime-startup-expired"
+		});
 		const bundle = {
 			client,
 			stateRepo: new StateRepo(client),
@@ -347,7 +417,7 @@ var MemxRuntimeManager = class {
 			graphRepo: new GraphRepo(client),
 			sourceSegmentRepo: new SourceSegmentRepo(client),
 			vectorRepo,
-			auditRepo: new AuditRepo(client),
+			auditRepo,
 			maintenanceRepo: new MaintenanceRepo(client),
 			beliefRepo: new BeliefRepo(client),
 			abstractionRepo: new AbstractionRepo(client),

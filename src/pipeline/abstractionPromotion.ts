@@ -714,6 +714,7 @@ export function runAbstractionPromotion(
   const runStartedAt = nowIso();
   const runId = store.auditRepo.startMaintenance({
     agentId: ctx.agentId,
+    sessionKey: options.batch?.sessionKey ?? ctx.sessionKey,
     jobType: "abstraction-promotion",
     stats: {},
     startedAt: runStartedAt,

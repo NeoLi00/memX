@@ -1,10 +1,12 @@
-import { applyClaudeJsonConnect, applyCodexTomlConnect, buildGenericMcpConfig } from "./connect.mjs";
-import { MEMX_NATIVE_HOOK_TIMEOUT_MS } from "../timeouts.mjs";
+import { MEMX_NATIVE_HOOK_TIMEOUT_MS, deriveNativeHookBudget } from "../timeouts.mjs";
 import { DEFAULT_MEMORY_CONFIG } from "../config.mjs";
-import { existsSync } from "node:fs";
+import { STANDALONE_ALLOWED_SCOPES, STANDALONE_DEFAULT_SCOPE, normalizeStandaloneScopeDefaults } from "./standaloneConfig.mjs";
+import { applyClaudeJsonConnect, applyClaudeJsonDisconnect, applyCodexTomlConnect, applyCodexTomlDisconnect, buildGenericMcpConfig } from "./connect.mjs";
+import { ensureMemxService } from "./serviceManager.mjs";
+import { cp, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { homedir, platform } from "node:os";
 import { dirname, join } from "node:path";
-import { cp, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 //#region src/host/standaloneQuickstart.ts
@@ -123,13 +125,8 @@ function deepMerge(base, override) {
 function baseStandaloneConfig() {
 	const config = structuredClone(DEFAULT_MEMORY_CONFIG);
 	config.dbPath = DEFAULT_DB_PATH;
-	config.defaultScope = "agent:{agentId}";
-	config.allowedScopes = [
-		"global",
-		"agent:{agentId}",
-		"session:{sessionKey}",
-		"project:{project}"
-	];
+	config.defaultScope = STANDALONE_DEFAULT_SCOPE;
+	config.allowedScopes = [...STANDALONE_ALLOWED_SCOPES];
 	config.advanced.llmClassifierEnabled = true;
 	config.advanced.enableTurnScheduler = true;
 	config.advanced.enableCompatibilityMemoryTools = false;
@@ -137,9 +134,8 @@ function baseStandaloneConfig() {
 }
 function applyStandaloneMemxQuickstartConfig(input, rawOptions) {
 	const options = normalizeOptions(rawOptions);
-	const next = deepMerge(baseStandaloneConfig(), input);
-	const currentQueryTimeout = next.advanced.queryCompilerHotPathTimeoutMs;
-	if (typeof currentQueryTimeout !== "number" || currentQueryTimeout < DEFAULT_MEMORY_CONFIG.advanced.queryCompilerHotPathTimeoutMs) next.advanced.queryCompilerHotPathTimeoutMs = DEFAULT_MEMORY_CONFIG.advanced.queryCompilerHotPathTimeoutMs;
+	const next = normalizeStandaloneScopeDefaults(deepMerge(baseStandaloneConfig(), input));
+	next.advanced.queryCompilerHotPathTimeoutMs = DEFAULT_MEMORY_CONFIG.advanced.queryCompilerHotPathTimeoutMs;
 	next.advanced.llmProvider = options.llmProvider;
 	next.advanced.llmBaseURL = options.llmBaseUrl;
 	next.advanced.llmClassifierModel = options.llmModel;
@@ -194,10 +190,11 @@ async function writeAtomic(path, text) {
 	await rename(tmp, path);
 }
 async function writeHookRuntimeConfig(path, options) {
+	const budget = deriveNativeHookBudget(MEMX_NATIVE_HOOK_TIMEOUT_MS);
 	const config = {
 		memxUrl: options.memxUrl,
 		...options.memxSecret ? { memxSecret: options.memxSecret } : {},
-		hookTimeoutMs: MEMX_NATIVE_HOOK_TIMEOUT_MS
+		hookTimeoutMs: budget.hookTimeoutMs
 	};
 	await writeAtomic(path, `${JSON.stringify(config, null, 2)}\n`);
 }
@@ -235,6 +232,19 @@ async function writeClaudeNativeSettings(options) {
 		path,
 		backupPath
 	};
+}
+async function disconnectCodexMcpConfig(path) {
+	if (!existsSync(path)) return;
+	const current = await readFile(path, "utf8");
+	const next = applyCodexTomlDisconnect(current);
+	if (next !== current.trimEnd()) await writeAtomic(path, next ? `${next}\n` : "");
+	return path;
+}
+async function disconnectClaudeMcpConfig(path) {
+	if (!existsSync(path)) return;
+	const next = applyClaudeJsonDisconnect(await readJson(path));
+	await writeAtomic(path, `${JSON.stringify(next, null, 2)}\n`);
+	return path;
 }
 async function installStandaloneRuntime(runtimeDir) {
 	const tmp = `${runtimeDir}.tmp-${process.pid}-${Date.now()}`;
@@ -584,7 +594,9 @@ async function writeHostConfig(options, commandConfig, codexPlugin, claudePlugin
 	if (options.target === "codex") {
 		if (codexPlugin && mcpTools === "none") return {
 			host: "codex",
-			codexPlugin
+			path: await disconnectCodexMcpConfig(trimOrUndefined(options.codexConfigPath) ?? join(options.homeDir, ".codex", "config.toml")),
+			codexPlugin,
+			mcpTools
 		};
 		const path = trimOrUndefined(options.codexConfigPath) ?? join(options.homeDir, ".codex", "config.toml");
 		await writeAtomic(path, applyCodexTomlConnect(existsSync(path) ? await readFile(path, "utf8") : "", options.memxUrl, options.memxSecret ?? "", commandConfig, mcpTools));
@@ -596,10 +608,13 @@ async function writeHostConfig(options, commandConfig, codexPlugin, claudePlugin
 	}
 	if (options.target === "claude-code") {
 		if (claudePlugin) {
+			const path = await disconnectClaudeMcpConfig(trimOrUndefined(options.claudeConfigPath) ?? join(options.homeDir, ".claude.json"));
 			const settings = await writeClaudeNativeSettings(options);
 			return {
 				host: "claude-code",
+				path,
 				claudePlugin,
+				mcpTools,
 				settingsPath: settings.path,
 				settingsBackupPath: settings.backupPath
 			};
@@ -664,6 +679,7 @@ async function runStandaloneMemxQuickstart(rawOptions, deps = {}) {
 	let hostConfig = null;
 	let codexPlugin = null;
 	let claudePlugin = null;
+	let service = null;
 	if (!options.dryRun) {
 		await installStandaloneRuntime(options.runtimeDir);
 		await writeAtomic(options.configPath, `${JSON.stringify(next, null, 2)}\n`);
@@ -678,13 +694,24 @@ async function runStandaloneMemxQuickstart(rawOptions, deps = {}) {
 			const result = await runCommand(step.command, step.args);
 			if (result.code !== 0) throw new Error(`standalone quickstart step failed: ${step.key} (${step.command} ${step.args.join(" ")}) exited ${result.code}`);
 		}
+		if (!options.skipServiceStart) {
+			service = await (deps.ensureService ?? ensureMemxService)({
+				homeDir: options.homeDir,
+				runtimeDir: options.runtimeDir,
+				configPath: options.configPath,
+				url: options.memxUrl,
+				secret: options.memxSecret
+			});
+			if (!service.ok) throw new Error(`standalone quickstart step failed: service-start (${service.error ?? "health check failed"})`);
+		}
 	}
 	return {
 		ok: true,
 		dryRun: Boolean(options.dryRun),
 		...redactSummary(options, steps, commandConfig, codexPlugin, claudePlugin, mcpTools),
 		hostConfig,
-		nextStep: "Start memx-server with this config, then use the configured host."
+		service,
+		nextStep: service?.ok ? "Use the configured host; memX service is running." : "Run `memx service restart` with this config, then use the configured host."
 	};
 }
 //#endregion

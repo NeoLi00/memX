@@ -1,9 +1,9 @@
 import { LEGACY_MEMX_PLUGIN_ID, MEMX_PLUGIN_ID, withoutLegacyPluginIds } from "../identity.mjs";
 import { DEFAULT_MEMORY_CONFIG } from "../config.mjs";
-import { existsSync } from "node:fs";
+import { cp, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { homedir, platform, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { cp, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 //#region src/host/quickstart.ts
@@ -24,6 +24,26 @@ function localVenvPython(homeDir) {
 	const venv = localVenvDir(homeDir);
 	return platform() === "win32" ? join(venv, "Scripts", "python.exe") : join(venv, "bin", "python");
 }
+const OPENCLAW_SAFE_PACKAGE_FILES = [
+	"dist",
+	"openclaw.plugin.json",
+	"README.md",
+	"README-ch.md",
+	"ARCHITECTURE.md",
+	"ARCHITECTURE-ch.md",
+	"assets"
+];
+const OPENCLAW_STANDALONE_PACKAGE_PATHS = [
+	".agents",
+	".codex-plugin",
+	".claude-plugin",
+	".mcp.json",
+	"hooks.json",
+	"hooks",
+	"skills",
+	"dist/.runtime/src/bin",
+	"dist/.runtime/src/host"
+];
 function resolveCurrentPackageRoot() {
 	return join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "..");
 }
@@ -37,6 +57,17 @@ async function prepareOpenClawInstallPackage(packageRoot) {
 		if (!existsSync(source)) continue;
 		await cp(source, join(targetDir, entry), { recursive: true });
 	}
+	for (const entry of OPENCLAW_STANDALONE_PACKAGE_PATHS) await rm(join(targetDir, entry), {
+		recursive: true,
+		force: true
+	});
+	const sanitizedPackage = {
+		...rawPackage,
+		files: OPENCLAW_SAFE_PACKAGE_FILES
+	};
+	delete sanitizedPackage.bin;
+	delete sanitizedPackage.scripts;
+	await writeFile(join(targetDir, "package.json"), `${JSON.stringify(sanitizedPackage, null, 2)}\n`, "utf8");
 	return targetDir;
 }
 function normalizeEmbeddingProvider(provider) {

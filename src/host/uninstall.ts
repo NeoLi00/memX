@@ -4,6 +4,7 @@ import { copyFile, mkdir, readFile, readdir, rename, rm, writeFile } from "node:
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { applyClaudeJsonDisconnect, applyCodexTomlDisconnect } from "./connect.js";
+import { stopMemxService, type MemxServiceStartOptions, type MemxServiceStatus } from "./serviceManager.js";
 import { LEGACY_MEMX_PLUGIN_ID, MEMX_PLUGIN_ID, withoutLegacyPluginIds } from "../identity.js";
 
 const DEFAULT_OPENCLAW_CONFIG_PATH = join(homedir(), ".openclaw", "openclaw.json");
@@ -32,6 +33,9 @@ export type UninstallCommandResult = {
 export type UninstallDeps = {
   now?: () => number;
   runCommand?: (command: string, args: string[]) => Promise<UninstallCommandResult>;
+  stopService?: (
+    options: Pick<MemxServiceStartOptions, "homeDir" | "url" | "secret">,
+  ) => Promise<MemxServiceStatus>;
 };
 
 export type OpenClawUninstallOptions = {
@@ -44,6 +48,8 @@ export type OpenClawUninstallOptions = {
 export type StandaloneUninstallOptions = {
   configPath?: string;
   homeDir?: string;
+  memxUrl?: string;
+  memxSecret?: string;
   codexBin?: string;
   claudeBin?: string;
   codexMarketplaceDir?: string;
@@ -278,7 +284,7 @@ export async function runOpenClawUninstall(
 
 export async function runCodexUninstall(
   rawOptions: StandaloneUninstallOptions = {},
-  deps: Pick<UninstallDeps, "now" | "runCommand"> = {},
+  deps: Pick<UninstallDeps, "now" | "runCommand" | "stopService"> = {},
 ): Promise<Record<string, unknown>> {
   const configPath = trimOrUndefined(rawOptions.configPath) ?? DEFAULT_CODEX_CONFIG_PATH;
   const codexBin = trimOrUndefined(rawOptions.codexBin) ?? "codex";
@@ -291,7 +297,13 @@ export async function runCodexUninstall(
   const next = applyCodexPluginDisconnect(applyCodexTomlDisconnect(current));
   let backupPath: string | null = null;
   const warnings: string[] = [];
+  let service: MemxServiceStatus | null = null;
   if (!dryRun) {
+    service = await (deps.stopService ?? stopMemxService)({
+      homeDir,
+      url: trimOrUndefined(rawOptions.memxUrl),
+      secret: trimOrUndefined(rawOptions.memxSecret),
+    });
     backupPath = await backupIfExists(configPath, now);
     await writeAtomic(configPath, next ? `${next}\n` : "");
     const runCommand = deps.runCommand ?? defaultRunCommand;
@@ -315,13 +327,14 @@ export async function runCodexUninstall(
     marketplaceDir,
     backupPath,
     warnings,
+    service,
     removed: current !== next,
   };
 }
 
 export async function runClaudeCodeUninstall(
   rawOptions: StandaloneUninstallOptions = {},
-  deps: Pick<UninstallDeps, "now" | "runCommand"> = {},
+  deps: Pick<UninstallDeps, "now" | "runCommand" | "stopService"> = {},
 ): Promise<Record<string, unknown>> {
   const configPath = trimOrUndefined(rawOptions.configPath) ?? DEFAULT_CLAUDE_CONFIG_PATH;
   const claudeBin = trimOrUndefined(rawOptions.claudeBin) ?? "claude";
@@ -335,7 +348,13 @@ export async function runClaudeCodeUninstall(
   let backupPath: string | null = null;
   let settingsPath: string | null = null;
   const warnings: string[] = [];
+  let service: MemxServiceStatus | null = null;
   if (!dryRun) {
+    service = await (deps.stopService ?? stopMemxService)({
+      homeDir,
+      url: trimOrUndefined(rawOptions.memxUrl),
+      secret: trimOrUndefined(rawOptions.memxSecret),
+    });
     backupPath = await backupIfExists(configPath, now);
     await writeAtomic(configPath, `${JSON.stringify(next, null, 2)}\n`);
     settingsPath = await restoreClaudeNativeSettings(homeDir);
@@ -362,6 +381,7 @@ export async function runClaudeCodeUninstall(
     backupPath,
     settingsPath,
     warnings,
+    service,
     removed: Boolean(
       current?.mcpServers &&
         typeof current.mcpServers === "object" &&

@@ -1,12 +1,12 @@
 import { clamp01, normalizeText, nowIso, objectRecord, stableHash, truncateText } from "../support.mjs";
-import { snapshotMemoryLlmBudgetAudit } from "./llmBudgetAudit.mjs";
+import { applyAbstractionRefinement, eligibleForLlmRefinement } from "./abstractionRefinement.mjs";
 import { canonicalStateKey, tokenizeSearchTerms } from "./semantic/heuristics.mjs";
 import { buildEntityMention, resolveEntityMention } from "./entityResolver.mjs";
+import { buildGraphPathCandidates } from "./graphPathEngine.mjs";
+import { snapshotMemoryLlmBudgetAudit } from "./llmBudgetAudit.mjs";
 import { buildMaintenanceContractMetadata, summarizeMaintenanceContractDiagnostics } from "./maintenanceContract.mjs";
 import "./semantics.mjs";
 import { describeStateValue } from "./memoryObjectsHelpers.mjs";
-import { buildGraphPathCandidates } from "./graphPathEngine.mjs";
-import { applyAbstractionRefinement, eligibleForLlmRefinement } from "./abstractionRefinement.mjs";
 import { contentStructuralComplexity } from "./sourceWeighting.mjs";
 import { deriveWorkflowPatternSummaries } from "./strategyHypotheses.mjs";
 //#region src/pipeline/abstractionJobs.ts
@@ -1307,6 +1307,7 @@ async function runAbstractionJobs(store, ctx, options = { refineWithLlm: false }
 	const runStartedAt = nowIso();
 	const runId = store.auditRepo.startMaintenance({
 		agentId: ctx.agentId,
+		sessionKey: options.batch?.sessionKey ?? ctx.sessionKey,
 		jobType: "abstraction-jobs",
 		stats: {},
 		startedAt: runStartedAt

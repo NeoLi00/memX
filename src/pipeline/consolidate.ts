@@ -388,6 +388,7 @@ export async function runConsolidation(
   const runStartedAt = nowIso();
   const runId = store.auditRepo.startMaintenance({
     agentId: ctx.agentId,
+    sessionKey: options.batch?.sessionKey ?? ctx.sessionKey,
     jobType: "consolidate",
     stats: {},
     startedAt: runStartedAt,
